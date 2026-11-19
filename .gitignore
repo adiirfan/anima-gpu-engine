@@ -1,0 +1,14 @@
+# weights (published on Hugging Face), built programs, test outputs, old copies
+w/
+ref_*/
+*.log
+ugpu
+ugpu_x86
+reader/*.so
+reader/fibotaps_x86
+tools/work/
+tools/todo_sim.py
+*_before_*
+*_snapshot.*
+rt_part1.txt
+x86icd/
