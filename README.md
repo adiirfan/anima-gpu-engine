@@ -34,7 +34,9 @@ the engine the hidden states it needs.
 - Every chip tunes itself on the first run (tile sizes, work-group sizes, kernel variants, each checked for correct
   answers before it is timed) and keeps the result in `<weights>.tune`.
 - Models bigger than the chip's memory stream their blocks in one block ahead, on a helper thread, through two fixed
-  slots of chip memory (`STREAM=1`).
+  slots of chip memory (`STREAM=1`). Every model can run that way from its published file, Klein and Anima included,
+  which is what lets phones with little memory run them: the chip then holds two blocks and the working pictures,
+  whatever the model's size, at the price of copying every block to the chip again each step.
 
 ## Build
 
@@ -63,11 +65,12 @@ receives the outputs. Main settings, as environment variables:
 | Setting | Meaning |
 |---|---|
 | `DRAW=<steps>` | run the whole sampling loop instead of one checked step |
-| `STREAM=1` | stream blocks from storage (models bigger than memory) |
+| `STREAM=1` | stream blocks from storage (models bigger than memory, or phones with little of it) |
 | `TUNEFILE=<path>` | where the tuning result is kept (default `<weights>.tune`) |
 | `SEED`, `SIGLIST`, `EULER` | sampling (Wan) |
 | `KERNELS`, `TAEKERNELS` | where `kernels.cl` / `tae.cl` are |
 | `PROF=1` | time every kernel |
+| `MEMREPORT=1` | print the chip memory the run asked for (`2`: also every piece of 16 MB or more) |
 
 ## Checking against the reference
 

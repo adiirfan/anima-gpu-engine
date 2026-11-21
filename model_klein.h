@@ -92,7 +92,9 @@ static int run(const std::string &R, int loops) {
         linear(3, "txt_in", Xctx, "txt_in", N, Dm, CTXD, res, nullptr, Ni, Lv);
         if (chk) statR("embedded");
         for (int i = 0; i < ND; i++) {
-            const std::string b = "d" + std::to_string(i) + ".";
+            // streamed (STREAM=1): the loader renamed the blocks "b<k>." (rt.h), two of them in memory at a time
+            const std::string b = (STREAM ? "b" : "d") + std::to_string(i) + ".";
+            if (STREAM) streamer.use(i, ND + NS);
             normLinear(0, "qkv", res, iSh1, iSc1, b + "img_qkv", N, 3 * Dm, Dm, QKV, nullptr, 0, Ni);
             normLinear(0, "qkv", res, tSh1, tSc1, b + "txt_qkv", N, 3 * Dm, Dm, QKV, nullptr, Ni, N);
             attnPrep(QKV, N, 0, Ni, 0, Dm / 8, 2 * Dm / 8, w(b + "img_qn"), w(b + "img_kn"), bP, bQ);
@@ -111,7 +113,8 @@ static int run(const std::string &R, int loops) {
             if (chk && i == ND - 1) check("double last", "x_double_last");
         }
         for (int j = 0; j < NS; j++) {
-            const std::string b = "s" + std::to_string(j) + ".";
+            const std::string b = (STREAM ? "b" + std::to_string(ND + j) : "s" + std::to_string(j)) + ".";
+            if (STREAM) streamer.use(ND + j, ND + NS);
             // one rounding of the normed stream feeds both 8-bit multiplies
             lnq(b + "qkv", res, sSh, sSc, N, Dm);
             gemmq(0, "qkv", b + "qkv", N, 3 * Dm, Dm, QKV, nullptr);

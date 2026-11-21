@@ -31,6 +31,7 @@ int main(int argc, char **argv) {
     KSRC = slurp(getenv("KERNELS") ? getenv("KERNELS") : "kernels.cl");
     std::string model = ops::loadModel(weights);
     if (model.empty()) model = "anima";
+    atexit(memReport);
     printf("model %s, load %.1f s (%zu weights)\n", model.c_str(),
            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), W.size());
     if (getenv("LOADTEST") && !SW.empty()) {   // how fast streamed blocks come in: storage read vs. hand-over to the chip

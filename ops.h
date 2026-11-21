@@ -31,8 +31,19 @@ static cl_kernel kQ[5], kRotX, kRotLn, kRotLnL, kRmsAdd;
 static int LNNEXT = 0;   // 1: the next lnq / normLinear uses a layer norm even in an RMSN model (Fibo's output layer)
 static cl_mem Xq, Sx;
 // 8-bit path: weights int8 ("q8") or int4 ("q4", two per byte, unpacked to int8 as they are staged)
-static bool isq8(const std::string &n) { auto it = W.find(n); return it != W.end() && (it->second.kind == "q8" || it->second.kind == "q4"); }
-static bool isq4(const std::string &n) { auto it = W.find(n); return it != W.end() && it->second.kind == "q4"; }
+// (a streamed table is in W only while its block is in use, so the streamed list is asked too)
+static bool isq8(const std::string &n) {
+    auto it = W.find(n);
+    if (it != W.end()) return it->second.kind == "q8" || it->second.kind == "q4";
+    auto st = SW.find(n);
+    return st != SW.end() && (st->second.kind == "q8" || st->second.kind == "q4");
+}
+static bool isq4(const std::string &n) {
+    auto it = W.find(n);
+    if (it != W.end()) return it->second.kind == "q4";
+    auto st = SW.find(n);
+    return st != SW.end() && st->second.kind == "q4";
+}
 static cl_kernel kQ4[5];
 
 // ---- mean centring for 8-bit layers (CEN=<file>): round (x - mu), add b = W.mu back; mu and b per noise level,

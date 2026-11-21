@@ -2,6 +2,7 @@
 // cl_khr_fp16 only, tunes the main multiply per chip on first run, loads weight files. Nothing in here knows a model.
 #pragma once
 #define CL_TARGET_OPENCL_VERSION 200
+#include <atomic>
 #include <CL/cl.h>
 #include <CL/cl_ext.h>
 #include <fcntl.h>
@@ -111,7 +112,17 @@ static cl_program build(const std::string &src, const std::string &opts0) {
 }
 static cl_kernel kern(cl_program p, const char *name) { cl_int e; cl_kernel k = clCreateKernel(p, name, &e); CK(e); return k; }
 
+// MEMREPORT=1: the chip memory the program asked for in all (pictures 16 bytes a cell, buffers their size), printed
+// at the end; streamed blocks reuse their two slots, so this is what a run holds
+static std::atomic<size_t> MEMB{0};
+static void memReport() { if (getenv("MEMREPORT")) printf("chip memory made: %.0f MB\n", MEMB.load() / 1e6); }
+// MEMREPORT=2: also one line for every piece of 16 MB or more as it is made
+static void memLine(const char *what, size_t bytes, int w, int h, bool filled) {
+    static const bool on = getenv("MEMREPORT") && atoi(getenv("MEMREPORT")) >= 2;
+    if (on && bytes >= (16u << 20)) fprintf(stderr, "  made %s %dx%d %s: %.0f MB (so far %.0f)\n", what, w, h, filled ? "weights" : "work", bytes / 1e6, MEMB.load() / 1e6);
+}
 static cl_mem img(int w, int h, const void *data = nullptr) {
+    MEMB += (size_t)w * h * 16; memLine("picture", (size_t)w * h * 16, w, h, data != nullptr);
     cl_image_format f = {CL_RGBA, CL_UNSIGNED_INT32};
     cl_image_desc d; memset(&d, 0, sizeof d);
     d.image_type = CL_MEM_OBJECT_IMAGE2D; d.image_width = w; d.image_height = h;
@@ -121,6 +132,7 @@ static cl_mem img(int w, int h, const void *data = nullptr) {
     return m;
 }
 static cl_mem buf(size_t bytes, const void *data = nullptr) {
+    MEMB += bytes; memLine("buffer", bytes, 0, 0, data != nullptr);
     cl_int e;
     cl_mem m = clCreateBuffer(ctx, data ? (CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR) : CL_MEM_READ_WRITE, bytes, (void *)data, &e);
     CK(e); return m;
@@ -296,6 +308,23 @@ static std::string loadGGUF(const std::string &path, const std::function<bool(co
             a = b + 1;
         }
     }
+    // Klein with STREAM=1: its blocks "d<i>." (double) and "s<j>." (single) take the streamer's names "b<i>." and
+    // "b<ND + j>." here, so the published file streams as it is
+    int kleinND = 0;
+    if (STREAM && model == "klein")
+        for (auto &t : tis) if (t.name[0] == 'd' && isdigit((unsigned char)t.name[1])) kleinND = std::max(kleinND, atoi(t.name.c_str() + 1) + 1);
+    const bool animaStream = STREAM && model == "anima";   // Anima's blocks are "<i>.": they stream as "b<i>."
+    auto alias = [&](const std::string &n) {
+        const size_t dot = n.find('.');
+        if (animaStream && dot != std::string::npos && dot > 0) {
+            bool num = true;
+            for (size_t i = 0; i < dot; i++) num = num && isdigit((unsigned char)n[i]);
+            if (num) return "b" + n;
+        }
+        if (!kleinND || dot == std::string::npos || dot < 2 || (n[0] != 'd' && n[0] != 's')) return n;
+        for (size_t i = 1; i < dot; i++) if (!isdigit((unsigned char)n[i])) return n;
+        return "b" + std::to_string(atoi(n.c_str() + 1) + (n[0] == 's' ? kleinND : 0)) + n.substr(dot);
+    };
     for (auto &t : tis) {
         if (skip && skip(t.name)) continue;
         auto k = kinds.find(t.name);
@@ -304,6 +333,7 @@ static std::string loadGGUF(const std::string &path, const std::function<bool(co
         if (!es) { fprintf(stderr, "GGUF tensor %s: type %u not supported\n", t.name.c_str(), t.type); exit(1); }
         Wt w{std::get<0>(k->second), std::get<1>(k->second), std::get<2>(k->second), nullptr};
         const char *src = base + data + t.off;
+        t.name = alias(t.name);
         if (streamedName(t.name, w.kind)) { SW[t.name] = {w.kind, w.M, w.K, src, t.n * es}; continue; }
         if (w.kind == "pk") w.m = img(w.M / 4, w.K / 2, src);
         else if (w.kind == "q8") w.m = q8img(w.M, w.K, src);

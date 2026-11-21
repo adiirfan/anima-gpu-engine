@@ -28,6 +28,8 @@ static void ropeTables(int hp, int wp, std::vector<float> &P, std::vector<float>
     }
 }
 
+// a block's table names: "<i>." in the file, "b<i>." when streamed (STREAM=1: the loader renames them, rt.h)
+static std::string blk(int i) { return (STREAM ? "b" : "") + std::to_string(i) + "."; }
 static int run(const std::string &weights, const std::string &R, int loops, int PW, int PH) {
     const int N = (PW / 16) * (PH / 16), LK = 256, Dm = WIDTH;
     ops::init(NHEADS, WIDTH, N, 4 * WIDTH);
@@ -36,7 +38,7 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
         const char *kinds[6] = {"sa_qkv", "sa_o", "ca_q", "ca_o", "l1", "l2"};
         const int kK[6] = {1, 1, 1, 1, 1, 4}, kM[6] = {3, 1, 1, 1, 4, 1};
         for (int b = 0; b < NB; b++)
-            for (int l = 0; l < 6; l++) L.push_back({std::to_string(b) + "." + kinds[l], kK[l] * Dm, kM[l] * Dm});
+            for (int l = 0; l < 6; l++) L.push_back({blk(b) + kinds[l], kK[l] * Dm, kM[l] * Dm});
         cenLoad(getenv("CEN"), L, NB);
     }
 
@@ -73,7 +75,7 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
     // cross-attention keys / values: once per picture
     std::vector<CrossKV> ckv(NB);
     for (int i = 0; i < NB; i++) {
-        std::string b = std::to_string(i) + ".";
+        std::string b = blk(i);
         gemm(0, "gemm ctx", Xc, w(b + "ca_kv"), LK, 2 * Dm, CTXD, KVc);
         ckv[i] = crossKV(KVc, LK, 0, Dm / 8, w(b + "ca_kn"));
     }
@@ -96,7 +98,7 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
             gemv("gemv", w("t2"), bT1, nullptr, bLora, 3 * Dm, Dm, 1);
             const char *mn[3] = {"msa", "mca", "mmlp"};
             for (int i = 0; i < NB; i++) for (int j = 0; j < 3; j++) {
-                std::string b = std::to_string(i) + "." + mn[j];
+                std::string b = blk(i) + mn[j];
                 gemv("gemv", w(b + "1"), bEmb, nullptr, bHid, 256, Dm, 1);
                 gemv("gemv", w(b + "2"), bHid, bLora, mod[i * 3 + j], 3 * Dm, 256, 0);
             }
@@ -107,7 +109,8 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
         }
         gemm(3, "gemm embed", Xp, w("x_embedder"), N, Dm, 72, res);
         for (int i = 0; i < NB; i++) {
-            const std::string b = std::to_string(i) + ".";
+            const std::string b = blk(i);
+            if (STREAM) streamer.use(i, NB);
             normLinear(0, "qkv", res, msh[i * 3], msc[i * 3], b + "sa_qkv", N, 3 * Dm, Dm, QKV);
             selfAttn(QKV, N, 0, Dm / 8, 2 * Dm / 8, w(b + "sa_qn"), w(b + "sa_kn"), bP, bQ, O, PW / 16, i);
             linear(2, "out", O, b + "sa_o", N, Dm, Dm, res, mg[i * 3]);
