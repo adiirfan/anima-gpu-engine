@@ -9,6 +9,25 @@ namespace anima {
 using namespace ops;
 static const int NB = 28, CTXD = 1024, WIDTH = 2048, NHEADS = 16;
 
+// Cosmos VideoRopePosition3DEmb for one picture (T = 1), Anima's extrapolation ratios 4 (height) and 4 (width):
+// per token 22 time pairs (all at position 0), 21 row pairs, 21 column pairs; P = [cos | cos], Q = [-sin | sin]
+// (checked against ComfyUI's tables for all sizes the app draws, to 2e-6).
+static void ropeTables(int hp, int wp, std::vector<float> &P, std::vector<float> &Q) {
+    const int D = 128, dh = D / 6 * 2, dt = D - 2 * dh;
+    const double th = 10000.0 * pow(4.0, (double)dh / (dh - 2));
+    P.assign((size_t)hp * wp * D, 1.0f); Q.assign((size_t)hp * wp * D, 0.0f);
+    for (int y = 0; y < hp; y++) for (int x = 0; x < wp; x++) {
+        const size_t r = ((size_t)y * wp + x) * D;
+        for (int i = 0; i < dh / 2; i++) {
+            const double f = 1.0 / pow(th, (2.0 * i) / dh);
+            const int ky = dt / 2 + i, kx = dt / 2 + dh / 2 + i;
+            const double ay = y * f, ax = x * f;
+            P[r + ky] = P[r + 64 + ky] = (float)cos(ay); Q[r + ky] = (float)-sin(ay); Q[r + 64 + ky] = (float)sin(ay);
+            P[r + kx] = P[r + 64 + kx] = (float)cos(ax); Q[r + kx] = (float)-sin(ax); Q[r + 64 + kx] = (float)sin(ax);
+        }
+    }
+}
+
 static int run(const std::string &weights, const std::string &R, int loops, int PW, int PH) {
     const int N = (PW / 16) * (PH / 16), LK = 256, Dm = WIDTH;
     ops::init(NHEADS, WIDTH, N, 4 * WIDTH);
@@ -22,8 +41,16 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
     }
 
     // ---- inputs ----
-    auto patches = rdf(R + "/patches.f32"), embraw = rdf(R + "/emb_raw.f32"), ctxv = rdf(R + "/ctx.f32");
-    auto Pt = rdf(R + "/rope_P.f32"), Qt = rdf(R + "/rope_Q.f32");
+    auto exists = [&](const char *n) { FILE *f = fopen((R + "/" + n).c_str(), "rb"); if (f) fclose(f); return f != nullptr; };
+    auto patches = rdf(R + "/patches.f32"), ctxv = rdf(R + "/ctx.f32");
+    // emb_raw: the test step's time signal (DRAW makes its own); rope tables: the test folder's, else made here
+    std::vector<float> embraw = exists("emb_raw.f32") ? rdf(R + "/emb_raw.f32") : std::vector<float>(WIDTH, 0.0f);
+    std::vector<float> Pt, Qt;
+    if (exists("rope_P.f32")) { Pt = rdf(R + "/rope_P.f32"); Qt = rdf(R + "/rope_Q.f32"); }
+    else ropeTables(PH / 16, PW / 16, Pt, Qt);
+    if (patches.size() != (size_t)N * 68 || ctxv.size() != (size_t)LK * CTXD) {
+        fprintf(stderr, "patches.f32 must hold %d x 68 and ctx.f32 %d x %d numbers\n", N, LK, CTXD); return 1;
+    }
     cl_mem bP = buf(Pt.size() * 4, Pt.data()), bQ = buf(Qt.size() * 4, Qt.data());
     cl_mem Xp = toX(patches, N, 68), Xc = toX(ctxv, LK, CTXD);
 
@@ -110,7 +137,9 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
     // DRAW=<steps>: a whole picture from the test folder's noise (Euler on the shift-3 flow schedule); the finished
     // latent patches go to <ref dir>/draw.f32. DRAWCOOL=<milli-degrees>: wait for thermal_zone31 before each step.
     if (getenv("DRAW")) {
-        const int steps = atoi(getenv("DRAW"));
+        // <ref>/sigmas.f32 (steps + 1 levels, the app's schedule) when present; DRAW=<steps> otherwise
+        std::vector<float> sg = exists("sigmas.f32") ? rdf(R + "/sigmas.f32") : std::vector<float>();
+        const int steps = sg.size() > 1 ? (int)sg.size() - 1 : atoi(getenv("DRAW"));
         const int cool = getenv("DRAWCOOL") ? atoi(getenv("DRAWCOOL")) : 0;
         auto sh = [](double t) { return 3 * t / (1 + 2 * t); };
         double total = 0;
@@ -121,7 +150,8 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
                 if (t <= cool) break;
                 usleep(500000);
             }
-            const float s0 = (float)sh(1.0 - (double)si / steps), s1 = si + 1 < steps ? (float)sh(1.0 - (double)(si + 1) / steps) : 0.0f;
+            const float s0 = sg.empty() ? (float)sh(1.0 - (double)si / steps) : sg[si],
+                        s1 = sg.empty() ? (si + 1 < steps ? (float)sh(1.0 - (double)(si + 1) / steps) : 0.0f) : sg[si + 1];
             sigma = s0;
             for (int k = 0; k < Dm / 2; k++) {
                 const float e = expf(-logf(10000.0f) * k / (Dm / 2)), a = s0 * e;

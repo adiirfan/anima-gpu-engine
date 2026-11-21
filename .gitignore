@@ -12,3 +12,4 @@ tools/todo_sim.py
 *_snapshot.*
 rt_part1.txt
 x86icd/
+reader/texttaps_x86

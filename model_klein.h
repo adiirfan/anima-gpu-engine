@@ -129,6 +129,17 @@ static int run(const std::string &R, int loops) {
     // DRAW=1: the whole picture from <ref>/noise.f32 along <ref>/sigmas.f32 (Euler), latent to <ref>/draw.f32
     if (getenv("DRAW")) {
         auto x = rdf(R + "/noise.f32"), sg = rdf(R + "/sigmas.f32");
+        // an edit: <ref>/ref.f32 is the picture to edit (Lr x 128), its rows are the last Lr picture rows of the
+        // stream (positions with index 10, as ComfyUI's "index" reference method); they are put back after every step
+        std::vector<float> ref;
+        if (FILE *rf = fopen((R + "/ref.f32").c_str(), "rb")) { fclose(rf); ref = rdf(R + "/ref.f32"); }
+        const size_t Lr = ref.size() / 128;
+        if (Lr > (size_t)Ni || x.size() + ref.size() != (size_t)Ni * 128) {
+            fprintf(stderr, "noise (%zu rows) + picture to edit (%zu rows) must fill the %d picture rows\n", x.size() / 128, Lr, Ni);
+            return 1;
+        }
+        x.insert(x.end(), ref.begin(), ref.end());
+        const size_t Ld = Ni - Lr;   // rows being drawn
         double total = 0;
         for (size_t si = 0; si + 1 < sg.size(); si++) {
             sigma = sg[si];
@@ -141,12 +152,12 @@ static int run(const std::string &R, int loops) {
             CK(clEnqueueReadImage(q, Yout, CL_TRUE, org, reg, 0, 0, y.data(), 0, 0, 0));
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
             total += ms;
-            for (int k8 = 0; k8 < 16; k8++) for (int n = 0; n < Ni; n++) for (int j = 0; j < 8; j++)
-                x[(size_t)n * 128 + k8 * 8 + j] += (sg[si + 1] - sg[si]) * (float)y[((size_t)k8 * N + n) * 8 + j];
+            for (int k8 = 0; k8 < 16; k8++) for (size_t n = 0; n < Ld; n++) for (int j = 0; j < 8; j++)
+                x[n * 128 + k8 * 8 + j] += (sg[si + 1] - sg[si]) * (float)y[((size_t)k8 * N + n) * 8 + j];
             printf("draw step %zu: sigma %.3f -> %.3f, %.1f ms\n", si, sg[si], sg[si + 1], ms); fflush(stdout);
         }
         FILE *f = fopen((R + "/draw.f32").c_str(), "wb");
-        fwrite(x.data(), 4, x.size(), f); fclose(f);
+        fwrite(x.data(), 4, Ld * 128, f); fclose(f);
         printf("drawing: %.1f s of steps, latent in %s/draw.f32\n", total / 1000, R.c_str());
         return 0;
     }

@@ -99,11 +99,16 @@ int main(int argc, char **argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;   // the processor: this runs on phones without the AI chip
+    // the processor only: the app's llama.cpp also carries the AI-chip backend, which would otherwise open a session
+    // on the AI chip (and fail when the app holds it)
+    static ggml_backend_dev_t cpuOnly[1] = {nullptr};   // no offload devices at all, as llama.cpp's "--device none"
+    mp.devices = cpuOnly;
     llama_model *model = llama_model_load_from_file(modelPath, mp);
     if (!model) { fprintf(stderr, "cannot load %s\n", modelPath); return 1; }
 
     Taps taps;
     llama_context_params cp = llama_context_default_params();
+    cp.op_offload = false;
     cp.n_ctx = 2048; cp.n_batch = 1024; cp.n_ubatch = 1024; cp.n_threads = cp.n_threads_batch = threads;
     cp.cb_eval = onTensor; cp.cb_eval_user_data = &taps;
     llama_context *lctx = llama_init_from_model(model, cp);

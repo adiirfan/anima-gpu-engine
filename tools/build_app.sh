@@ -17,3 +17,7 @@ J="$APP/app/src/main/jniLibs/arm64-v8a"
 timeout 300 "$CXX" -O2 -std=c++17 -static-libstdc++ reader/fibotaps.cpp -o "$J/libfibotaps.so" \
     -I$L/include -I$L/ggml/include -I$L/tools/mtmd -L"$J" -lmtmd -lllama -lggml -lggml-base
 ls -la "$J/libugpu.so" "$J/libfibotaps.so" "$APP/app/src/main/assets/ugpu/"
+# Klein's and Anima's prompt readers for the graphics-chip route (reader/texttaps.cpp), same libraries
+timeout 300 "$CXX" -O3 -ffast-math -std=c++17 -static-libstdc++ reader/texttaps.cpp -o "$J/libtexttaps.so" \
+    -I$L/include -I$L/ggml/include -L"$J" -lllama -lggml -lggml-base
+ls -la "$J/libtexttaps.so"

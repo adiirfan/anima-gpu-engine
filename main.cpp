@@ -10,6 +10,7 @@
 #include "model_tae.h"
 #include "model_moss.h"
 #include "model_fibo.h"
+#include "model_vaeenc.h"
 
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);   // each line reaches the app as soon as it is printed (a pipe is block-buffered otherwise)
@@ -64,6 +65,7 @@ int main(int argc, char **argv) {
     if (model == "tae") return tae::run(R, loops);
     if (model == "moss") return moss::run(R, loops);
     if (model == "fibo") return fibo::run(R, loops);
+    if (model == "vaeenc") return vaeenc::run(R, loops);
     fprintf(stderr, "no wiring for model %s\n", model.c_str());
     return 1;
 }

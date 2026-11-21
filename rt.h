@@ -52,14 +52,60 @@ static std::vector<float> rdf(const std::string &p) {
 }
 
 static std::string KEXTRA;   // options added to every kernel build (e.g. -DNO_IDP=1 on chips without the byte dot product)
+// KCACHE=<folder>: keep each built program there and load it next run instead of building it again (the chip's
+// compiler takes seconds per run). The file name covers the source, the options, the chip and its driver, so a
+// changed kernel or a driver update builds afresh; a file the driver refuses is simply built again and replaced.
+static std::string kcachePath(const std::string &src, const std::string &opts) {
+    const char *dir = getenv("KCACHE");
+    if (!dir || !*dir) return "";
+    char dn[256] = {0}, dv[256] = {0};
+    clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof dn - 1, dn, 0);
+    clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof dv - 1, dv, 0);
+    uint64_t h = 1469598103934665603ull;   // FNV-1a over everything that changes the built program
+    auto mix = [&](const std::string &x) { for (unsigned char c : x) { h ^= c; h *= 1099511628211ull; } h ^= 0xff; h *= 1099511628211ull; };
+    mix(src); mix(opts); mix(dn); mix(dv);
+    char name[40]; snprintf(name, sizeof name, "/%016llx.bin", (unsigned long long)h);
+    return std::string(dir) + name;
+}
 static cl_program build(const std::string &src, const std::string &opts0) {
     const std::string opts = opts0 + KEXTRA;
-    const char *s = src.c_str(); cl_int err;
+    const std::string cp = kcachePath(src, opts);
+    cl_int err;
+    if (!cp.empty()) {
+        if (FILE *f = fopen(cp.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            std::vector<unsigned char> bin(n > 0 ? n : 0);
+            const bool got = n > 0 && fread(bin.data(), 1, n, f) == (size_t)n;
+            fclose(f);
+            if (got) {
+                const unsigned char *b = bin.data(); size_t bn = bin.size(); cl_int st = 0;
+                cl_program p = clCreateProgramWithBinary(ctx, 1, &dev, &bn, &b, &st, &err);
+                if (!err && !st && !clBuildProgram(p, 1, &dev, opts.c_str(), 0, 0)) return p;
+                if (p) clReleaseProgram(p);
+            }
+            remove(cp.c_str());   // refused (driver changed underneath): build from source below
+        }
+    }
+    const char *s = src.c_str();
     cl_program p = clCreateProgramWithSource(ctx, 1, &s, 0, &err); CK(err);
     if (clBuildProgram(p, 1, &dev, opts.c_str(), 0, 0)) {
         size_t n; clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, 0, &n);
         std::string log(n, 0); clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, n, &log[0], 0);
         fprintf(stderr, "build failed [%s]:\n%s\n", opts.c_str(), log.c_str()); exit(1);
+    }
+    if (!cp.empty()) {   // keep it for next time; written aside and renamed so a killed run leaves no half file
+        size_t bn = 0;
+        if (!clGetProgramInfo(p, CL_PROGRAM_BINARY_SIZES, sizeof bn, &bn, 0) && bn) {
+            std::vector<unsigned char> bin(bn); unsigned char *b = bin.data();
+            if (!clGetProgramInfo(p, CL_PROGRAM_BINARIES, sizeof b, &b, 0)) {
+                const std::string tmp = cp + ".part";
+                if (FILE *f = fopen(tmp.c_str(), "wb")) {
+                    const bool ok = fwrite(b, 1, bn, f) == bn;
+                    fclose(f);
+                    if (ok) rename(tmp.c_str(), cp.c_str()); else remove(tmp.c_str());
+                }
+            }
+        }
     }
     return p;
 }
