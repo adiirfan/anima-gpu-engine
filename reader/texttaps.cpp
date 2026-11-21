@@ -73,6 +73,11 @@ int main(int argc, char **argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;   // the processor: this runs on phones without the AI chip
+    // No rearranged private copy of the weights (llama.cpp's "repack") when READER_NOCOPY=1 (phones with little
+    // memory) or the prompt is short. The weights are then used straight from the mapped file, which the phone can
+    // drop and read again, so the reader needs almost no memory of its own. Making the copy costs more time than its
+    // faster arithmetic wins back on a short prompt; on a long one (an edit's picture rows) the copy is quicker.
+    if (getenv("READER_NOCOPY") || T < 120) mp.use_extra_bufts = false;
     // the processor only: the app's llama.cpp also carries the AI-chip backend, which would otherwise open a session
     // on the AI chip (and fail when the app holds it)
     static ggml_backend_dev_t cpuOnly[1] = {nullptr};   // no offload devices at all, as llama.cpp's "--device none"
