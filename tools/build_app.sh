@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=${1:-/home/debian/anima-android}
-CXX=/home/debian/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++
+CXX=/home/debian/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++
 mkdir -p "$APP/app/src/main/jniLibs/arm64-v8a" "$APP/app/src/main/assets/ugpu"
 timeout 300 "$CXX" -O2 -std=c++17 -static-libstdc++ -I/home/debian/ugpu/third_party/OpenCLHeaders \
     main.cpp -o "$APP/app/src/main/jniLibs/arm64-v8a/libugpu.so" -L/home/debian/ugpu/third_party/lib -lOpenCL

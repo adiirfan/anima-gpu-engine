@@ -1,5 +1,5 @@
 // Universal graphics-chip engine for diffusion transformers on phones (2026-11-18).
-// Usage: ugpu <weights prefix or .gguf file> <ref dir> [loops] [WxH]
+// Usage: ugpu <weights prefix or .gguf file> <ref dir> [loops] [WxH]   |   ugpu --probe (prints "byte-dot 0/1")
 // The model comes from the "#model <name>" line of the weights index (default anima). Settings (environment):
 //   Q8=<8-bit weights prefix>  Q8KEEP=<layers kept fp16>  CEN=<centring table>  PVSM=1  TODO=1 [TODOB=a,b]
 //   PROF=1  DRAW=<steps> [DRAWCOOL=<mC>]  LCFG/CFG (skip tuning)  TUNEFILE (default <weights>.tune)
@@ -14,6 +14,13 @@
 
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);   // each line reaches the app as soon as it is printed (a pipe is block-buffered otherwise)
+    if (argc == 2 && std::string(argv[1]) == "--probe") {   // what the app asks before picking a model's files
+        clInit();
+        char ext[8192] = {0};
+        clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, sizeof ext - 1, ext, 0);
+        printf("byte-dot %d\n", strstr(ext, "cl_khr_integer_dot_product") != nullptr);   // fast 8-bit maths
+        return 0;
+    }
     if (argc < 3) { fprintf(stderr, "usage: %s <weights prefix> <ref dir> [loops] [WxH]\n", argv[0]); return 1; }
     const std::string weights = argv[1], R = argv[2];
     const int loops = argc > 3 ? atoi(argv[3]) : 1;

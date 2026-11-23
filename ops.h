@@ -45,6 +45,12 @@ static bool isq4(const std::string &n) {
     return st != SW.end() && st->second.kind == "q4";
 }
 static cl_kernel kQ4[5];
+// A16 (chips without the byte dot product, auto on old phone drivers; QA16=0/1 overrides): each 8-bit layer is turned
+// into fp16 weights just before it runs (deq8, one scratch image per shape) and the tuned fp16 multiply does the work;
+// inputs are rotated but not rounded or centred (rotq HOUT). Models with real biases or other epilogues keep 8-bit maths.
+static int A16 = 0;
+static cl_kernel kDeq, kDeq4, kSwiglu16;
+static std::map<std::pair<int, int>, cl_mem> deqImg;
 
 // ---- mean centring for 8-bit layers (CEN=<file>): round (x - mu), add b = W.mu back; mu and b per noise level,
 // blended between the two nearest calibrated levels. The model names the layers and their sizes in file order.
@@ -150,6 +156,7 @@ static void init(int heads, int width, int maxTokens, int maxK) {
     cl_program pb = build(KSRC, "-DDO_Q=1 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf);
     kLn = kern(pb, "lnmod2"); kGemv = kern(pb, "gemv"); kRmsAdd = kern(pb, "rmsadd"); kPq = kern(pb, "prepq"); kRowRms = kern(pb, "rowrms");
     kPrepSelf = kern(build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf), "attnprep");
+    kSwiglu16 = kern(pb, "swiglu16");
     if (QKF) { rqB = buf((size_t)maxTokens * 4); rkB = buf((size_t)maxTokens * 4); }
     {
         cl_program pc = build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=0 -DMAXT=2" + qkf);
@@ -173,8 +180,16 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         if (getenv("QGS")) QGS = atoi(getenv("QGS"));
         if (getenv("QCFG")) sscanf(getenv("QCFG"), "%d,%d,%d", &QTNv, &QOBv, &QWGv);
         if (getenv("QT")) QTv = atoi(getenv("QT"));
-        const int rot = getenv("QROT") ? atoi(getenv("QROT")) : 1, cenv = getenv("CEN") || BIASES ? 1 : 0;
+        const int rot = getenv("QROT") ? atoi(getenv("QROT")) : 1;
+        int cenv = getenv("CEN") || BIASES ? 1 : 0;
+        A16 = (getenv("QA16") ? atoi(getenv("QA16")) : KEXTRA.find("ACC32") != std::string::npos) && !BIASES && !GELUT && !SITU;
+        const char *a16o = A16 ? " -DHOUT=1" : "";
+        if (A16) cenv = 0;   // fp16 inputs need no centring (W(x - mu) + W.mu is W x)
         const std::string qsrc = kslice("// ======== 8-bit path", "// ======== fused attention");
+        if (A16) {
+            snprintf(o, sizeof o, "-DGS=%d", QGS); kDeq = kern(build(qsrc, o), "deq8");
+            snprintf(o, sizeof o, "-DGS=%d -DW4=1", QGS); kDeq4 = kern(build(qsrc, o), "deq8");
+        }
         for (int e : {0, 1, 2, 3, 4}) {
             snprintf(o, sizeof o, "-DEPI=%d -DGS=%d -DQTN=%d -DQOB=%d -DQWG=%d -DROT=%d -DSRC=0 -DCEN=%d -DGELU_TANH=%d -DSITU=%d", e, QGS, QTNv, QOBv, QWGv, rot, cenv, GELUT, SITU);
             kQ[e] = kern(build(qsrc, o), "gemmq");
@@ -182,14 +197,15 @@ static void init(int heads, int width, int maxTokens, int maxK) {
             for (auto &kv : SW) if (kv.second.kind == "q4") { any4 = true; break; }
             if (any4) kQ4[e] = kern(build(qsrc, std::string(o) + " -DW4=1"), "gemmq");
         }
-        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=0 -DQT=%d -DCEN=%d", QGS, rot, QTv, cenv);
+        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=0 -DQT=%d -DCEN=%d%s", QGS, rot, QTv, cenv, a16o);
         kRotX = kern(build(qsrc, o), "rotq");
-        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=%d", QGS, rot, QTv, cenv, RMSN);
+        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=%d%s", QGS, rot, QTv, cenv, RMSN, a16o);
         kRotLn = kern(build(qsrc, o), "rotq");
-        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=0", QGS, rot, QTv, cenv);
+        snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=0%s", QGS, rot, QTv, cenv, a16o);
         kRotLnL = RMSN ? kern(build(qsrc, o), "rotq") : kRotLn;
-        Xq = img(MAXN, MAXK / 16); Sx = buf((size_t)MAXN * (MAXK / QGS) * 4);
-        printf("8-bit multiplies: GS %d, rotation %d, cfg %d,%d,%d\n", QGS, rot, QTNv, QOBv, QWGv);
+        Xq = img(MAXN, MAXK / (A16 ? 8 : 16)); Sx = buf((size_t)MAXN * (MAXK / QGS) * 4);
+        printf("8-bit multiplies: GS %d, rotation %d, cfg %d,%d,%d%s\n", QGS, rot, QTNv, QOBv, QWGv,
+               A16 ? ", turned into 16-bit per layer (no byte dot product)" : "");
     }
     // work buffers for the largest token count
     const int N = MAXN;
@@ -277,7 +293,7 @@ static void gemmq(int epi, const char *tag, const std::string &wn, int N, int M,
 static void rotq(const std::string &wn, cl_mem in, int N, int K, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
     arg(kRotX, 0, in); arg(kRotX, 1, N); arg(kRotX, 2, K); arg(kRotX, 3, Xq); arg(kRotX, 4, Sx);
-    auto c = cen.find(wn); if (c != cen.end()) arg(kRotX, 5, c->second.first);
+    auto c = cen.find(wn); if (c != cen.end() && !A16) arg(kRotX, 5, c->second.first);
     run(kRotX, "rotq", 64, n1 - n0, 1, 64, QTv, 0, n0);
 }
 static void lnmod(cl_mem res, cl_mem sh, cl_mem sc, cl_mem Y, int N, int Dm, int n0 = 0, int n1 = -1) {
@@ -292,15 +308,38 @@ static void lnq(const std::string &wn, cl_mem res, cl_mem sh, cl_mem sc, int N, 
     cl_kernel kr = LNNEXT ? kRotLnL : kRotLn;
     arg(kr, 0, res); arg(kr, 1, sh); arg(kr, 2, sc); arg(kr, 3, eps); arg(kr, 4, N); arg(kr, 5, Dm);
     arg(kr, 6, Xq); arg(kr, 7, Sx);
-    auto c = cen.find(wn); if (c != cen.end()) arg(kr, 8, c->second.first);
+    auto c = cen.find(wn); if (c != cen.end() && !A16) arg(kr, 8, c->second.first);
     run(kr, "lnq", 64, n1 - n0, 1, 64, QTv, 0, n0);
+}
+// A16: the fp16 W-layout copy of 8-bit layer wn (M x K), made now in the scratch image for its shape
+static cl_mem deq(const std::string &wn, int M, int K) {
+    cl_mem &d = deqImg[{M, K}];
+    if (!d) d = img(M / 4, K / 2);
+    cl_kernel k = isq4(wn) ? kDeq4 : kDeq;
+    arg(k, 0, w(wn)); arg(k, 1, w(wn + ".s")); arg(k, 2, M); arg(k, 3, K); arg(k, 4, d);
+    run(k, "deq8", M / 4, K / 16, 1, 16, 4);
+    return d;
+}
+static bool useA16(const std::string &wn, int epi) { (void)wn; return A16 && epi <= 4; }
+// A16 multiply of the rounded input Xq by layer wn; SwiGLU (epi 4) as a plain multiply into a scratch image + swiglu16
+static void a16(int epi, const char *tag, const std::string &wn, int N, int M, int K, cl_mem out, cl_mem gate, int n0, int n1) {
+    cl_mem Wd = deq(wn, M, K);
+    if (epi != 4) { gemm(epi, tag, Xq, Wd, n1, M, K, out, gate, 1, 0, 0, 0, 0, 0, 0, 0, n0, N); return; }
+    static cl_mem tmp = nullptr; static int tmpH = 0;
+    if (tmpH < M / 8) { if (tmp) clReleaseMemObject(tmp); tmp = img(MAXN, M / 8); tmpH = M / 8; }
+    gemm(0, tag, Xq, Wd, n1, M, K, tmp, nullptr, 1, 0, 0, 0, 0, 0, 0, 0, n0, N);
+    arg(kSwiglu16, 0, tmp); arg(kSwiglu16, 1, n1); arg(kSwiglu16, 2, out);
+    run(kSwiglu16, "swiglu16", n1 - n0, M / 16, 1, 16, 4, n0, 0);
 }
 // out = X W^T (epi 0 plain, 1 gelu, 2 res += r*gate, 3 res = r); 8-bit when the layer has 8-bit weights
 // tokens [n0, n1) of N (default all); epi 4 = SwiGLU (8-bit layers only so far)
 static void linear(int epi, const char *tag, cl_mem X, const std::string &wn, int N, int M, int K, cl_mem out, cl_mem gate = nullptr,
                    int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
-    if (isq8(wn)) { rotq(wn, X, N, K, n0, n1); gemmq(epi, tag, wn, N, M, K, out, gate, n0, n1); }
+    if (isq8(wn) && useA16(wn, epi)) {
+        rotq(wn, X, N, K, n0, n1);
+        a16(epi, tag, wn, N, M, K, out, gate, n0, n1);
+    } else if (isq8(wn)) { rotq(wn, X, N, K, n0, n1); gemmq(epi, tag, wn, N, M, K, out, gate, n0, n1); }
     else {
         if (epi == 4) { fprintf(stderr, "SwiGLU needs 8-bit weights (%s)\n", wn.c_str()); exit(1); }
         gemm(epi, tag, X, w(wn), n1, M, K, out, gate, 1, 0, 0, 0, 0, 0, 0, 0, n0, N);
@@ -310,7 +349,10 @@ static void linear(int epi, const char *tag, cl_mem X, const std::string &wn, in
 static void normLinear(int epi, const char *tag, cl_mem res, cl_mem sh, cl_mem sc, const std::string &wn, int N, int M, int K,
                        cl_mem out, cl_mem gate = nullptr, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
-    if (isq8(wn)) { lnq(wn, res, sh, sc, N, K, n0, n1); gemmq(epi, tag, wn, N, M, K, out, gate, n0, n1); }
+    if (isq8(wn) && useA16(wn, epi)) {
+        lnq(wn, res, sh, sc, N, K, n0, n1);
+        a16(epi, tag, wn, N, M, K, out, gate, n0, n1);
+    } else if (isq8(wn)) { lnq(wn, res, sh, sc, N, K, n0, n1); gemmq(epi, tag, wn, N, M, K, out, gate, n0, n1); }
     else {
         if (epi == 4) { fprintf(stderr, "SwiGLU needs 8-bit weights (%s)\n", wn.c_str()); exit(1); }
         lnmod(res, sh, sc, Xa, N, K, n0, n1); gemm(epi, tag, Xa, w(wn), n1, M, K, out, gate, 1, 0, 0, 0, 0, 0, 0, 0, n0, N);
@@ -354,7 +396,8 @@ struct Streamer {
             jobs.push_back(std::async(std::launch::async, [this, &w, s] {
                 if (w.m) { refill(lq, *s, w.m); return; }
                 w = Wt{s->kind, s->M, s->K, nullptr};
-                if (s->kind == "q8") w.m = q8img(s->M, s->K, s->src);
+                if (s->kind == "pk") w.m = img(s->M / 4, s->K / 2, s->src);   // STREAM_PK=1: fp16 blocks too
+                else if (s->kind == "q8") w.m = q8img(s->M, s->K, s->src);
                 else if (s->kind == "q4") w.m = q8img(s->M, s->K, s->src, 32);
                 else w.m = buf(s->bytes, s->src);
             }));

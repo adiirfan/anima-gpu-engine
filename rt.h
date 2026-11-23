@@ -166,6 +166,8 @@ static void run(cl_kernel k, const char *tag, size_t g0, size_t g1, size_t g2, s
         clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, 8, &a, 0);
         clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, 8, &b, 0);
         tsum[tag] += (b - a) * 1e-6; clReleaseEvent(e);
+        static const bool live = getenv("PROFV") != nullptr;   // PROFV=1: every kernel's time as it finishes
+        if (live) printf("  %s %.1f ms (%zu x %zu)\n", tag, (b - a) * 1e-6, gws[0], gws[1]);
     }
 }
 
@@ -259,8 +261,16 @@ static std::string GPROG;
 struct SInfo { std::string kind; int M, K; const char *src; size_t bytes; };
 static std::map<std::string, SInfo> SW;
 static bool STREAM = false;
+// STREAM_PK=1 (fp16 models on chips without a fast 8-bit dot product): a block's six big fp16 tables stream too, the
+// same ones an 8-bit model streams; the small ones used outside the block loop (prompt keys, modulation) stay loaded
+static bool pkStreamable(const std::string &n) {
+    static const char *big[] = {".sa_qkv", ".sa_o", ".ca_q", ".ca_o", ".l1", ".l2"};
+    for (const char *t : big) { const size_t l = strlen(t); if (n.size() > l && n.compare(n.size() - l, l, t) == 0) return true; }
+    return false;
+}
 static bool streamedName(const std::string &n, const std::string &kind) {
-    return STREAM && n.size() > 2 && n[0] == 'b' && isdigit((unsigned char)n[1]) && (kind == "q8" || kind == "q4" || kind == "qs");
+    return STREAM && n.size() > 2 && n[0] == 'b' && isdigit((unsigned char)n[1]) && (kind == "q8" || kind == "q4" || kind == "qs" ||
+                                                                       (kind == "pk" && getenv("STREAM_PK") && pkStreamable(n)));
 }
 static std::string loadGGUF(const std::string &path, const std::function<bool(const std::string &)> &skip = nullptr) {
     int fd = open(path.c_str(), O_RDONLY);
@@ -352,6 +362,9 @@ static void refill(cl_command_queue lq, const SInfo &s, cl_mem m) {
         const char *d = q8layout(s.M, s.K, s.src, s.kind == "q4" ? 32 : 16, t, w, h);
         const size_t o[3] = {0, 0, 0}, r[3] = {(size_t)w, (size_t)h, 1};
         CK(clEnqueueWriteImage(lq, m, CL_TRUE, o, r, (size_t)w * 16, 0, d, 0, 0, 0));
+    } else if (s.kind == "pk") {   // fp16 packed weights: the file holds the image's texels row by row
+        const size_t o[3] = {0, 0, 0}, r[3] = {(size_t)s.M / 4, (size_t)s.K / 2, 1};
+        CK(clEnqueueWriteImage(lq, m, CL_TRUE, o, r, (size_t)s.M / 4 * 16, 0, s.src, 0, 0, 0));
     } else CK(clEnqueueWriteBuffer(lq, m, CL_TRUE, 0, s.bytes, s.src, 0, 0, 0));
 }
 // ask the system to start reading block b's tables from storage now, in big pieces (page cache only: the phone
@@ -421,6 +434,12 @@ static void clInit() {
 #ifndef __aarch64__
     if (!strstr(ext, "cl_khr_integer_dot_product")) KEXTRA += " -DNO_IDP=1";   // computer test builds only
 #endif
+    // old phone drivers (no byte dot product, e.g. Adreno 630 from 2018) flush tiny 16-bit products to zero: use the
+    // scaled pair sums (kernels.cl, DOT8). KDEFS replaces the choice, e.g. KDEFS=-DACC32=1 for exact fp32 sums.
+    if (getenv("KDEFS")) KEXTRA += std::string(" ") + getenv("KDEFS");
+#ifdef __aarch64__
+    else if (!strstr(ext, "cl_khr_integer_dot_product")) KEXTRA += " -DACC32=4 -DSCL=64";
+#endif
     const bool low = strcmp(pr, "low") == 0 && strstr(ext, "cl_khr_priority_hints");
     cl_queue_properties qp[] = {CL_QUEUE_PROPERTIES, prof ? (cl_queue_properties)CL_QUEUE_PROFILING_ENABLE : 0,
                                 low ? (cl_queue_properties)CL_QUEUE_PRIORITY_KHR : 0, low ? (cl_queue_properties)CL_QUEUE_PRIORITY_LOW_KHR : 0, 0};
@@ -471,8 +490,23 @@ static void tune(const std::string &src, const std::string &cacheFile) {
     cl_command_queue tq = clCreateCommandQueueWithProperties(ctx, dev, qp, &err); CK(err);
     std::vector<GemmCfg> cands = {
         {1, 2, 4, 128, 64}, {1, 2, 4, 64, 64}, {1, 1, 4, 128, 64}, {1, 2, 2, 128, 64}, {1, 1, 8, 128, 64},
-        {1, 2, 4, 256, 64}, {1, 2, 8, 128, 64}, {1, 4, 2, 64, 64},
-        {0, 6, 2, 16, 8}, {0, 4, 2, 16, 8}, {0, 8, 2, 16, 8}, {0, 4, 4, 8, 8}};
+        {1, 2, 4, 256, 64}, {1, 4, 2, 64, 64}, {1, 4, 2, 64, 256}, {1, 4, 2, 128, 512}, {1, 2, 4, 128, 256},
+        {0, 6, 2, 16, 8}, {0, 4, 2, 16, 8}, {0, 8, 2, 16, 8}, {0, 4, 4, 8, 8},
+        {1, 2, 8, 128, 64}};   // last: 16 totals per item overflow Adreno 630's registers, 1.4 s, then the driver aborts
+    // TUNE_CANDS="l a b c d,l a b c d": try only these (one at a time keeps a layout that crashes an old driver from
+    // stopping the rest); TUNE_ONLY=1 stops the program after tuning
+    if (const char *tc = getenv("TUNE_CANDS")) {
+        cands.clear();
+        for (const char *c = tc; *c;) {
+            GemmCfg g; int used = 0;
+            if (sscanf(c, "%d %d %d %d %d%n", &g.local, &g.a, &g.b, &g.c, &g.d, &used) != 5) break;
+            cands.push_back(g); c += used; while (*c == ',' || *c == ' ') c++;
+        }
+    }
+    // old drivers (the scaled pair sums, ACC32=4): more than 8 running totals per item spill out of the registers
+    // (10x slower) and the 16-total layout makes Adreno 630's driver abort, so those are not tried there
+    if (KEXTRA.find("ACC32") != std::string::npos)
+        cands.erase(std::remove_if(cands.begin(), cands.end(), [](const GemmCfg &g) { return g.a * g.b > 8; }), cands.end());
     GemmCfg best{}; double bestMs = 1e9;
     for (auto &g : cands) {
         char o[256];
@@ -543,6 +577,7 @@ static void tune(const std::string &src, const std::string &cacheFile) {
     if (FILE *f = fopen(cacheFile.c_str(), "w")) {
         fprintf(f, "%s\n%d %d %d %d %d\n", key.c_str(), best.local, best.a, best.b, best.c, best.d); fclose(f);
     }
+    if (getenv("TUNE_ONLY")) exit(0);
 }
 
 static double relerr(const std::vector<float> &a, const std::vector<float> &b) {

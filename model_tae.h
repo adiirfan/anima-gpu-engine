@@ -13,14 +13,17 @@ static int run(const std::string &R, int loops) {
     if (FILE *f = fopen((R + "/info.txt").c_str(), "r")) { if (fscanf(f, "%d %d", &h, &wd0) != 2) h = 0; if (fscanf(f, "%d", &NT) != 1) NT = 1; fclose(f); }
     if (!h) { fprintf(stderr, "%s/info.txt missing or bad\n", R.c_str()); return 1; }
     const bool IMG = !getenv("TAEBUF");   // picture memory (texture cache) unless TAEBUF=1
+    // output channels (OC) and pixels (PX) per work item: old chips without the byte dot product (Adreno 630, the
+    // ACC32 drivers) are limited by image reads, and 32 channels x 4 pixels halves the decode there (Sony XZ3, tae_w21
+    // 512 x 512: about 45 s -> 12 to 21 s, the same picture bit for bit); newer chips keep 8 x 4
+    const bool oldChip = KEXTRA.find("ACC32") != std::string::npos;
+    const int TPX = getenv("TPX") ? atoi(getenv("TPX")) : 4, TOC = getenv("TOC") ? atoi(getenv("TOC")) : oldChip ? 32 : 8;
     char opt[128];
-    snprintf(opt, sizeof opt, "-DPX=%s -DOC=%s -DACC=%s", getenv("TPX") ? getenv("TPX") : "4", getenv("TOC") ? getenv("TOC") : "8",
-             getenv("TACC") ? getenv("TACC") : "float");
+    snprintf(opt, sizeof opt, "-DPX=%d -DOC=%d -DACC=%s", TPX, TOC, getenv("TACC") ? getenv("TACC") : "float");
     cl_program prog = build(slurp(getenv("TAEKERNELS") ? getenv("TAEKERNELS") : "tae.cl"), opt);
     cl_kernel kConv = kern(prog, "conv"), kClamp = kern(prog, "clampt"), kConvI = kern(prog, "convi"), kClampI = kern(prog, "clampi");
     cl_kernel kGnS = kern(prog, "gnstats"), kGnA = kern(prog, "gnapply");
     cl_mem gnSt = buf(64 * 2 * 4);
-    const int TPX = getenv("TPX") ? atoi(getenv("TPX")) : 4, TOC = getenv("TOC") ? atoi(getenv("TOC")) : 8;
 
     // ---- the layer list, and the largest activation it needs ----
     struct Op { std::string kind, name; int ci = 0, co = 0, k = 0, bias = 0, relu = 0, up = 0, skip = 0; };

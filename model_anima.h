@@ -79,6 +79,13 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
         gemm(0, "gemm ctx", Xc, w(b + "ca_kv"), LK, 2 * Dm, CTXD, KVc);
         ckv[i] = crossKV(KVc, LK, 0, Dm / 8, w(b + "ca_kn"));
     }
+    if (STREAM) {   // low-memory mode: the prompt's key/value tables are used only here (~235 MB fp16): give them back
+        CK(clFinish(q));
+        for (int i = 0; i < NB; i++) {
+            auto it = W.find(blk(i) + "ca_kv");
+            if (it != W.end() && it->second.m) { clReleaseMemObject(it->second.m); it->second.m = nullptr; }
+        }
+    }
 
     std::vector<float> tn(Dm);
     CK(clEnqueueReadBuffer(q, w("t_norm"), CL_TRUE, 0, Dm * 4, tn.data(), 0, 0, 0));
@@ -119,6 +126,13 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
             linear(2, "out", O, b + "ca_o", N, Dm, Dm, res, mg[i * 3 + 1]);
             normLinear(1, "mlp1", res, msh[i * 3 + 2], msc[i * 3 + 2], b + "l1", N, 4 * Dm, Dm, H);
             linear(2, "mlp2", H, b + "l2", N, Dm, 4 * Dm, res, mg[i * 3 + 2]);
+            if (const char *dd = getenv("DUMPBLK")) {   // the residual stream after every block, as stored (compare chips)
+                std::vector<float> raw((size_t)N * Dm);
+                CK(clEnqueueReadBuffer(q, res, CL_TRUE, 0, raw.size() * 4, raw.data(), 0, 0, 0));
+                if (FILE *df = fopen((std::string(dd) + "/b" + std::to_string(i) + ".f32").c_str(), "wb")) {
+                    fwrite(raw.data(), 4, raw.size(), df); fclose(df);
+                }
+            }
             if (check && (i == 0 || i == 1 || i == NB - 1)) {
                 std::vector<float> raw((size_t)N * Dm), out((size_t)N * Dm);
                 CK(clEnqueueReadBuffer(q, res, CL_TRUE, 0, raw.size() * 4, raw.data(), 0, 0, 0));
@@ -175,6 +189,10 @@ static int run(const std::string &weights, const std::string &R, int loops, int 
         FILE *f = fopen((R + "/draw.f32").c_str(), "wb");
         fwrite(patches.data(), 4, patches.size(), f); fclose(f);
         printf("drawing: %.1f s of steps, latent in %s/draw.f32\n", total / 1000, R.c_str());
+        if (prof) {   // PROF=1: time per kernel over all steps (each kernel waited on, so the total runs slower)
+            double tot = 0; for (auto &kv : tsum) tot += kv.second;
+            for (auto &kv : tsum) printf("  %-12s %8.1f ms  %4.1f%%\n", kv.first.c_str(), kv.second, 100 * kv.second / tot);
+        }
         return 0;
     }
     step(true);
