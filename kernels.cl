@@ -279,6 +279,9 @@ __kernel void lnmod2(__global const float4 *res, __global const float4 *sh, __gl
 #ifndef QKFULL
 #define QKFULL 0
 #endif
+#ifndef KVR
+#define KVR 1   // query heads per key / value head (Krea: 48 queries share 12 key / value heads)
+#endif
 __kernel void attnprep(__read_only image2d_t In, int N, int qr, int kr, int vr,
                        __global const float *qw, __global const float *kw, float qscale,
                        __global const float *P, __global const float *Q,
@@ -287,7 +290,7 @@ __kernel void attnprep(__read_only image2d_t In, int N, int qr, int kr, int vr,
                        , __global const float *rq, __global const float *rkf   // whole-width 1/rms per token
 #endif
                        ) {
-    const int n0 = get_global_id(0) * 4, h = get_global_id(1);
+    const int n0 = get_global_id(0) * 4, h = get_global_id(1), hk = h / KVR;
     if (n0 >= N) return;
 #if QKFULL
     qw += h * 128; kw += h * 128;
@@ -317,7 +320,7 @@ __kernel void attnprep(__read_only image2d_t In, int N, int qr, int kr, int vr,
     float rk[4];
     for (int t = 0; t < 4; t++) {
         float ss = 0;
-        for (int c = 0; c < 16; c++) { float8 a = convert_float8(LD8(In, n0 + t, kr + h * 16 + c)); ss += dot(a.lo, a.lo) + dot(a.hi, a.hi); }
+        for (int c = 0; c < 16; c++) { float8 a = convert_float8(LD8(In, n0 + t, kr + hk * 16 + c)); ss += dot(a.lo, a.lo) + dot(a.hi, a.hi); }
 #if QKFULL
         rk[t] = rkf[min(n0 + t, N - 1)];
 #else
@@ -328,10 +331,10 @@ __kernel void attnprep(__read_only image2d_t In, int N, int qr, int kr, int vr,
         float8 a[4];
         for (int t = 0; t < 4; t++) {
             const int n = min(n0 + t, N - 1);
-            a[t] = convert_float8(LD8(In, n0 + t, kr + h * 16 + c)) * vload8(c, kw) * rk[t];
+            a[t] = convert_float8(LD8(In, n0 + t, kr + hk * 16 + c)) * vload8(c, kw) * rk[t];
 #if ROPE
             const int cs = c ^ 8;
-            float8 p = convert_float8(LD8(In, n0 + t, kr + h * 16 + cs)) * vload8(cs, kw) * rk[t];
+            float8 p = convert_float8(LD8(In, n0 + t, kr + hk * 16 + cs)) * vload8(cs, kw) * rk[t];
             a[t] = a[t] * vload8(c, P + n * 128) + p * vload8(c, Q + n * 128);
 #endif
         }
@@ -344,8 +347,8 @@ __kernel void attnprep(__read_only image2d_t In, int N, int qr, int kr, int vr,
 #endif
 #if DO_V
     for (int c = 0; c < 16; c++) {
-        half8 a0 = LD8(In, n0, vr + h * 16 + c), a1 = LD8(In, n0 + 1, vr + h * 16 + c);
-        half8 a2 = LD8(In, n0 + 2, vr + h * 16 + c), a3 = LD8(In, n0 + 3, vr + h * 16 + c);
+        half8 a0 = LD8(In, n0, vr + hk * 16 + c), a1 = LD8(In, n0 + 1, vr + hk * 16 + c);
+        half8 a2 = LD8(In, n0 + 2, vr + hk * 16 + c), a3 = LD8(In, n0 + 3, vr + hk * 16 + c);
         ST8(Vo, h * 32 + c * 2, n0 / 2, (half8)(a0.lo, a1.lo));
         ST8(Vo, h * 32 + c * 2 + 1, n0 / 2, (half8)(a0.hi, a1.hi));
         ST8(Vo, h * 32 + c * 2, n0 / 2 + 1, (half8)(a2.lo, a3.lo));
@@ -543,7 +546,7 @@ __kernel void rowrms(__read_only image2d_t In, int N, int c0, int C8, __global f
     if (l == 0 && n < N) out[n] = rsqrt(red[0] / (C8 * 8) + 1e-6f);
 }
 
-// y[m] = W[m] . act(x) + add[m]   (W fp16 row-major [M][K]); act = silu when SILU
+// y[m] = W[m] . act(x) + add[m]   (W fp16 row-major [M][K]); act: silu = 1 SiLU, 2 GELU (tanh), 0 none
 __kernel void gemv(__global const half *W, __global const float *x, __global const float *add,
                    __global float *y, int M, int K, int silu) {
     const int m = get_global_id(0);
@@ -552,10 +555,57 @@ __kernel void gemv(__global const half *W, __global const float *x, __global con
     const __global half *w = W + (size_t)m * K;
     for (int k = 0; k < K; k += 8) {
         float8 a = vload8(0, x + k);
-        if (silu) a = a / (1.0f + exp(-a));
+        if (silu == 1) a = a / (1.0f + exp(-a));
+        else if (silu == 2) a = 0.5f * a * (1.0f + tanh(0.7978845608f * (a + 0.044715f * a * a * a)));   // GELU (tanh)
         s += dot(convert_float8(vload8(0, w + k)).lo, a.lo) + dot(convert_float8(vload8(0, w + k)).hi, a.hi);
     }
     y[m] = s + (add ? add[m] : 0.0f);
+}
+
+// Krea's text fusion: attention inside groups of G consecutive rows (the 12 reader layers of one prompt token, or all
+// prompt rows), q / k rms-normed with qn / kn (eps 1e-5), no rope. In: X layout, q / k / v at texel columns qr / kr /
+// vr, 16 texels (128 channels) per head. One work item per (row, head): launch (n1, heads).
+__kernel void grpattn(__read_only image2d_t In, int n1, int grp, int qr, int kr, int vr,
+                      __global const float *qw, __global const float *kw, __write_only image2d_t O) {
+    const int n = get_global_id(0), h = get_global_id(1);
+    if (n >= n1) return;
+    const int g0 = n / grp * grp, g1 = min(g0 + grp, n1);
+    float8 qv[16], acc[16];
+    float ss = 0;
+    for (int c = 0; c < 16; c++) { qv[c] = convert_float8(LD8(In, n, qr + h * 16 + c)); ss += dot(qv[c].lo, qv[c].lo) + dot(qv[c].hi, qv[c].hi); }
+    const float rq = rsqrt(ss / 128 + 1e-5f) * 0.08838834764f;   // and 1 / sqrt(128)
+    for (int c = 0; c < 16; c++) { qv[c] *= vload8(c, qw) * rq; acc[c] = (float8)0.0f; }
+    float m = -INFINITY, l = 0;
+    for (int j = g0; j < g1; j++) {
+        float kk = 0, s = 0;
+        for (int c = 0; c < 16; c++) {
+            const float8 a = convert_float8(LD8(In, j, kr + h * 16 + c));
+            kk += dot(a.lo, a.lo) + dot(a.hi, a.hi);
+            const float8 b = a * vload8(c, kw) * qv[c];
+            s += b.s0 + b.s1 + b.s2 + b.s3 + b.s4 + b.s5 + b.s6 + b.s7;
+        }
+        s *= rsqrt(kk / 128 + 1e-5f);
+        const float mn = fmax(m, s), corr = exp(m - mn), p = exp(s - mn);
+        l = l * corr + p;
+        for (int c = 0; c < 16; c++) acc[c] = acc[c] * corr + p * convert_float8(LD8(In, j, vr + h * 16 + c));
+        m = mn;
+    }
+    for (int c = 0; c < 16; c++) ST8(O, n, h * 16 + c, convert_half8(acc[c] / l));
+}
+// Krea's text MLP: Z = gelu_tanh(Y + b), X layout. launch (N, C / 8)
+__kernel void biasgelu(__read_only image2d_t Y, __global const float *b, int N, __write_only image2d_t Z) {
+    const int n = get_global_id(0), c = get_global_id(1);
+    if (n >= N) return;
+    const float8 a = convert_float8(LD8(Y, n, c)) + vload8(c, b);
+    ST8(Z, n, c, convert_half8(0.5f * a * (1.0f + tanh(0.7978845608f * (a + 0.044715f * a * a * a)))));
+}
+// Krea: the attention output times sigmoid(gate), the gate at texel column gc of G (both X layout, texel (n, c8)).
+// launch (N, Dm / 8)
+__kernel void sgate(__read_only image2d_t O, __read_only image2d_t Gt, int gc, int N, __write_only image2d_t Y) {
+    const int n = get_global_id(0), c = get_global_id(1);
+    if (n >= N) return;
+    const float8 o = convert_float8(LD8(O, n, c)), g = convert_float8(LD8(Gt, n, gc + c));
+    ST8(Y, n, c, convert_half8(o / (1.0f + exp(-g))));
 }
 
 // SwiGLU after a 16-bit multiply (chips without the byte dot product): Y holds the stored rows [gate 8][up 8] per 16

@@ -14,6 +14,9 @@
 // mode "qimg": Qwen-Image 2.1's reader (Qwen3-VL-8B's language half): the last layer's output WITHOUT the final
 //   norm (llama.cpp's "l_out-<last>"), as the AI-chip route's reader -> <out>/hidden.f32 (T x n_embd); the caller
 //   drops the system turn's rows
+// mode "krea" <rows to drop>: Krea 2's reader (Qwen3-VL-4B's language half), as ComfyUI's Krea2 text encoder: the
+//   stream just before layers 2, 5, 8, ..., 35 (= "l_out-1/4/.../34"), no norm, side by side per row; the first
+//   <rows to drop> rows (the system turn and "<|im_start|>user\n") are left out -> <out>/ctx.f32 (T' x 12*n_embd)
 // mode "anima" <adapter.gguf> <T5 ids: int32> <T5 weights: float32>: "last", then Anima's prompt adapter
 //   (anima_adapter.h) -> <out>/ctx.f32 (256 x 1024, rows past the T5 prompt zero)
 // Exit code 0 on success.
@@ -35,7 +38,7 @@ struct Taps {
 };
 
 // modes that read their rows through the tensor callback (and need the full graph); the others use the final norm
-static bool tapped_mode(const std::string &m) { return m == "klein" || m == "qimg"; }
+static bool tapped_mode(const std::string &m) { return m == "klein" || m == "qimg" || m == "krea"; }
 
 static bool onTensor(struct ggml_tensor *t, bool ask, void *ud) {
     auto *tp = (Taps *)ud;
@@ -93,6 +96,7 @@ int main(int argc, char **argv) {
 
     Taps taps;
     if (mode == "klein") taps.names = {"l_out-8", "l_out-17", "l_out-26"};
+    else if (mode == "krea") for (int l = 1; l <= 34; l += 3) taps.names.push_back("l_out-" + std::to_string(l));
     else if (mode == "qimg") taps.names = {};   // set once the model's layer count is known
     else if (mode == "last" || mode == "anima") taps.names = {"result_norm"};   // filled from the embeddings below
     else { fprintf(stderr, "unknown mode %s\n", mode.c_str()); return 1; }
@@ -211,11 +215,17 @@ int main(int argc, char **argv) {
         llama_backend_free();
         return 0;
     }
-    const std::string path = out + (mode == "klein" ? "/ctx.f32" : "/hidden.f32");
+    size_t drop = 0;
+    if (mode == "krea") {
+        drop = argc > 6 ? (size_t)atol(argv[6]) : 0;
+        if (drop >= T) { fprintf(stderr, "dropping %zu of %zu rows leaves none\n", drop, T); return 1; }
+    }
+    const std::string path = out + (mode == "klein" || mode == "krea" ? "/ctx.f32" : "/hidden.f32");
     FILE *f = fopen(path.c_str(), "wb");
-    if (!f || fwrite(o.data(), sizeof(float), o.size(), f) != o.size()) { fprintf(stderr, "cannot write %s\n", path.c_str()); return 1; }
+    const size_t keep = (T - drop) * RW;
+    if (!f || fwrite(o.data() + drop * RW, sizeof(float), keep, f) != keep) { fprintf(stderr, "cannot write %s\n", path.c_str()); return 1; }
     fclose(f);
-    printf("done: %zu rows x %zu, %.1f s\n", T, RW, secs());
+    printf("done: %zu rows x %zu, %.1f s\n", T - drop, RW, secs());
 
     llama_batch_free(b); llama_free(lctx); llama_model_free(model); llama_backend_free();
     return 0;

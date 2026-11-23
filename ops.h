@@ -12,7 +12,9 @@ static const int HD = 128;                  // channels per attention head (ever
 static int HEADS = 16, D = 2048;            // the model's heads and width (set by the model)
 static int MAXN = 1024, MAXK = 8192;        // largest token count / multiply input the work buffers are sized for
 
-static cl_kernel kG[4], kLn, kGemv, kPrepSelf, kPrepKV, kPq, kPqc, kKVdown, kPVsm, kFlash;
+static cl_kernel kG[4], kLn, kGemv, kPrepSelf, kPrepKV, kPq, kPqc, kKVdown, kPVsm, kFlash, kSgate, kGrp, kBiasGelu;
+static int KVREP = 1;        // query heads per key / value head (set before init; Krea 4)
+static float LNEPS = 1e-6f;  // the norm before 8-bit layers (Krea 1e-5)
 static std::map<std::string, cl_kernel> kSoftBy;   // softmax kernels per (lanes, rows, texels per lane)
 
 // options read once from the environment
@@ -155,8 +157,8 @@ static void init(int heads, int width, int maxTokens, int maxK) {
     const std::string qkf = QKF ? " -DQKFULL=1" : "";
     cl_program pb = build(KSRC, "-DDO_Q=1 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf);
     kLn = kern(pb, "lnmod2"); kGemv = kern(pb, "gemv"); kRmsAdd = kern(pb, "rmsadd"); kPq = kern(pb, "prepq"); kRowRms = kern(pb, "rowrms");
-    kPrepSelf = kern(build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf), "attnprep");
-    kSwiglu16 = kern(pb, "swiglu16");
+    kPrepSelf = kern(build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf + (KVREP > 1 ? " -DKVR=" + std::to_string(KVREP) : "")), "attnprep");
+    kSgate = kern(pb, "sgate"); kGrp = kern(pb, "grpattn"); kBiasGelu = kern(pb, "biasgelu"); kSwiglu16 = kern(pb, "swiglu16");
     if (QKF) { rqB = buf((size_t)maxTokens * 4); rkB = buf((size_t)maxTokens * 4); }
     {
         cl_program pc = build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=0 -DMAXT=2" + qkf);
@@ -319,7 +321,7 @@ static void lnmod(cl_mem res, cl_mem sh, cl_mem sc, cl_mem Y, int N, int Dm, int
 }
 static void lnq(const std::string &wn, cl_mem res, cl_mem sh, cl_mem sc, int N, int Dm, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
-    float eps = 1e-6f;
+    float eps = LNEPS;
     cl_kernel kr = LNNEXT ? kRotLnL : kRotLn;
     arg(kr, 0, res); arg(kr, 1, sh); arg(kr, 2, sc); arg(kr, 3, eps); arg(kr, 4, N); arg(kr, 5, Dm);
     arg(kr, 6, Xq); arg(kr, 7, Sx);
@@ -380,6 +382,21 @@ static void gemv(const char *tag, cl_mem Wm, cl_mem x, cl_mem add, cl_mem y, int
     run(kGemv, tag, M, 1, 1, 64, 1);
 }
 
+// Y = O * sigmoid(G[gc..]) for tokens [0, N) (Krea's gated attention output; gc = gate's first texel column in G)
+static void sgate(cl_mem O, cl_mem G, int gc, int N, int Dm, cl_mem Y) {
+    arg(kSgate, 0, O); arg(kSgate, 1, G); arg(kSgate, 2, gc); arg(kSgate, 3, N); arg(kSgate, 4, Y);
+    run(kSgate, "sgate", N, Dm / 8, 1, 16, 4);
+}
+// attention inside groups of G rows of QKV, rows [0, n1), all HEADS heads, no rope (Krea's text fusion) into O
+static void grpAttn(cl_mem QKV, int n1, int G, int qr, int kr, int vr, cl_mem qn, cl_mem kn, cl_mem O) {
+    cl_kernel k = kGrp;
+    arg(k, 0, QKV); arg(k, 1, n1); arg(k, 2, G); arg(k, 3, qr); arg(k, 4, kr); arg(k, 5, vr); arg(k, 6, qn); arg(k, 7, kn); arg(k, 8, O);
+    run(k, "grpattn", n1, HEADS, 1, 16, 1);
+}
+static void biasGelu(cl_mem Y, cl_mem b, int N, int C, cl_mem Z) {
+    arg(kBiasGelu, 0, Y); arg(kBiasGelu, 1, b); arg(kBiasGelu, 2, N); arg(kBiasGelu, 3, Z);
+    run(kBiasGelu, "biasgelu", N, C / 8, 1, 16, 4);
+}
 // res rows [n0, n1) += rms_norm(A) * w (A: X-layout output of a layer)
 static void rmsAdd(cl_mem A, cl_mem res, cl_mem wv, int N, int Dm, int n0, int n1) {
     arg(kRmsAdd, 0, A); arg(kRmsAdd, 1, res); arg(kRmsAdd, 2, wv); arg(kRmsAdd, 3, N); arg(kRmsAdd, 4, Dm);
