@@ -10,7 +10,7 @@ Layout for the engine:
 Usage: python pack_moss.py <out.gguf> [strength 0.7] [lora file]   (ComfyUI's ROCm venv; BITS=8 for 8-bit)"""
 import os
 import sys
-sys.path[:0] = ["/home/debian/gpu-engine-test/tsbuild/anima", "/home/debian/llama.cpp/gguf-py"]
+sys.path[:0] = ["/home/debian/anima-qnn", "/home/debian/llama.cpp/gguf-py"]
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -19,9 +19,9 @@ import gguf
 
 OUT = sys.argv[1]
 ST = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
-LP = sys.argv[3] if len(sys.argv) > 3 else "/home/debian/moss-build/dmd/lora_latest.safetensors"
+LP = sys.argv[3] if len(sys.argv) > 3 else "/home/debian/phone-v81/moss/models/lora_latest.safetensors"
 GS, BITS = 32, int(os.environ.get("BITS", "4"))
-SRC = "/home/debian/moss-build/models/moss_image_sft_bf16.safetensors"
+SRC = "/home/debian/phone-v81/moss/models/moss_image_sft_bf16.safetensors"
 D, H, HD, FF, NB = 3072, 24, 128, 8192, 42
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 HT = anima_qnn._HT.to(dev)

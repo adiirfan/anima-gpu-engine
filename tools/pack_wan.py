@@ -10,7 +10,7 @@ here so the engine's kernels apply unchanged:
 Usage: py.sh pack_wan.py <out.gguf> [GS]"""
 import os
 import sys
-sys.path[:0] = ["/home/debian/gpu-engine-test/tsbuild/anima", "/home/debian/llama.cpp/gguf-py"]
+sys.path[:0] = ["/home/debian/anima-qnn", "/home/debian/llama.cpp/gguf-py"]
 import numpy as np
 import torch
 from safetensors import safe_open
