@@ -2,6 +2,9 @@
 // (already wrapped and tokenized, as for the AI-chip route) and gets the reader's inner states back as float32 rows.
 //
 //   texttaps <reader.gguf> <ids file: int32> <out dir> <threads> <mode>
+// An ids file ending in ".txt" is a prompt instead, split into words here (special words parsed, as llama.cpp's server
+// does). READER_HTP=1 runs the reader on the AI chip (MOSS: mode "last" with the prompt as text replaces the old
+// llama-server on 127.0.0.1, which some phones refused without an internet connection).
 //
 // mode "klein": FLUX.2 klein's reader (Qwen3-4B), as ComfyUI's Qwen3_4BModel with layer=[9, 18, 27]: the stream
 //   just before layers 9, 18 and 27 (= llama.cpp's "l_out-8/17/26"), no norm, side by side per row
@@ -31,6 +34,9 @@ struct Taps {
     std::map<std::string, std::vector<float>> rows;
 };
 
+// modes that read their rows through the tensor callback (and need the full graph); the others use the final norm
+static bool tapped_mode(const std::string &m) { return m == "klein" || m == "qimg"; }
+
 static bool onTensor(struct ggml_tensor *t, bool ask, void *ud) {
     auto *tp = (Taps *)ud;
     bool want = false;
@@ -58,7 +64,28 @@ int main(int argc, char **argv) {
     auto secs = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
     std::vector<llama_token> ids;
-    { FILE *f = fopen(argv[2], "rb");
+    const std::string idsPath = argv[2];
+    const bool fromText = idsPath.size() > 4 && idsPath.compare(idsPath.size() - 4, 4, ".txt") == 0;
+    if (fromText) {   // a .txt prompt: split into words here, special words included, as llama.cpp's server does
+        std::string text;
+        { FILE *f = fopen(argv[2], "rb");
+          if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
+          char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n); fclose(f); }
+        llama_backend_init();
+        llama_model_params vp = llama_model_default_params();
+        vp.vocab_only = true;
+        static ggml_backend_dev_t none[1] = {nullptr};
+        vp.devices = none;
+        llama_model *vm = llama_model_load_from_file(argv[1], vp);
+        if (!vm) { fprintf(stderr, "cannot read the word list of %s\n", argv[1]); return 1; }
+        const llama_vocab *voc = llama_model_get_vocab(vm);
+        ids.resize(text.size() + 16);
+        const int n = llama_tokenize(voc, text.data(), (int32_t)text.size(), ids.data(), (int32_t)ids.size(), true, true);
+        if (n < 0) { fprintf(stderr, "prompt too long\n"); return 1; }
+        ids.resize(n);
+        llama_model_free(vm);
+    } else {
+      FILE *f = fopen(argv[2], "rb");
       if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
       int32_t v; while (fread(&v, 4, 1, f) == 1) ids.push_back(v); fclose(f); }
     const size_t T = ids.size();
@@ -82,6 +109,41 @@ int main(int argc, char **argv) {
     // on the AI chip (and fail when the app holds it)
     static ggml_backend_dev_t cpuOnly[1] = {nullptr};   // no offload devices at all, as llama.cpp's "--device none"
     mp.devices = cpuOnly;
+    // READER_GPU=1: the whole reader on the graphics chip (llama.cpp's OpenCL backend), for builds that carry it
+    static ggml_backend_dev_t gpuOnly[2] = {nullptr, nullptr};
+    if (getenv("READER_GPU")) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpuOnly[0] = d; break; }
+        }
+        if (!gpuOnly[0]) { fprintf(stderr, "READER_GPU: no graphics device in this build\n"); return 1; }
+        printf("reader on %s\n", ggml_backend_dev_description(gpuOnly[0])); fflush(stdout);
+        mp.devices = gpuOnly;
+        // every layer on the chip but not the word-guessing head: its scores are never read here (only the final
+        // norm's rows are), and for 151,936 words it was 14 of 63 s on an Adreno 630
+        int nl = 999;   // the layer count from the file's own metadata ("<arch>.block_count")
+        gguf_init_params gp = {true, nullptr};
+        if (gguf_context *g = gguf_init_from_file(argv[1], gp)) {
+            const int64_t ka = gguf_find_key(g, "general.architecture");
+            if (ka >= 0) {
+                const int64_t kb = gguf_find_key(g, (std::string(gguf_get_val_str(g, ka)) + ".block_count").c_str());
+                if (kb >= 0) nl = (int)gguf_get_val_u32(g, kb);
+            }
+            gguf_free(g);
+        }
+        // and with LLAMA_EMBD_ONLY (this tree's llama.cpp) the head is not built at all, so every layer can go
+        if (!tapped_mode(mode)) setenv("LLAMA_EMBD_ONLY", "1", 0);
+        mp.n_gpu_layers = getenv("LLAMA_EMBD_ONLY") ? 999 : nl;
+    }
+    // READER_HTP=1: the whole reader on the AI chip (llama.cpp's Hexagon backend, device HTP0), for MOSS's 9B reader
+    static ggml_backend_dev_t htpOnly[2] = {nullptr, nullptr};
+    if (getenv("READER_HTP")) {
+        htpOnly[0] = ggml_backend_dev_by_name("HTP0");
+        if (!htpOnly[0]) { fprintf(stderr, "READER_HTP: no AI-chip device in this build\n"); return 1; }
+        mp.devices = htpOnly;
+        mp.n_gpu_layers = 999;
+        mp.use_extra_bufts = true;
+    }
     llama_model *model = llama_model_load_from_file(argv[1], mp);
     if (!model) { fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
     if (mode == "qimg") taps.names = {"l_out-" + std::to_string(llama_model_n_layer(model) - 1)};
@@ -92,7 +154,8 @@ int main(int argc, char **argv) {
     cp.op_offload = false;
     const uint32_t nc = (uint32_t)((T + 63) / 64 * 64);   // only as much room as the prompt needs (memory)
     cp.n_ctx = nc; cp.n_batch = nc; cp.n_ubatch = nc; cp.n_threads = cp.n_threads_batch = threads;
-    const bool tapped = mode == "klein" || mode == "qimg";
+    if (getenv("READER_HTP") && nc > 512) cp.n_ubatch = 512;   // the AI chip's working size (as the app's server used)
+    const bool tapped = tapped_mode(mode);
     cp.embeddings = !tapped;   // keeps result_norm for every row (no word guessing at the end)
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
     if (tapped) { cp.cb_eval = onTensor; cp.cb_eval_user_data = &taps; }
