@@ -7,7 +7,7 @@ Layout for the engine:
     [gate 8][up 8] per 16 rows for the engine's paired activation (SITU in model_moss.h).
   - norms (n1, n2, final) kept as fp32 vectors, folded into the modulation on the host each step.
   - the 2 prompt blocks (tb0, tb1) and the prompt projection with their biases ("<name>.b").
-Usage: python pack_moss.py <out.gguf> [strength 0.7] [lora file]   (ComfyUI's ROCm venv; BITS=8 for 8-bit)"""
+Usage: python pack_moss.py <out.gguf> [strength 0.7] [lora file]   (ComfyUI's ROCm venv; BITS=8 for 8-bit, GS=256 for the Vulkan layout)"""
 import os
 import sys
 sys.path[:0] = ["/home/debian/anima-qnn", "/home/debian/llama.cpp/gguf-py"]
@@ -20,7 +20,7 @@ import gguf
 OUT = sys.argv[1]
 ST = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
 LP = sys.argv[3] if len(sys.argv) > 3 else "/home/debian/phone-v81/moss/models/lora_latest.safetensors"
-GS, BITS = 32, int(os.environ.get("BITS", "4"))
+GS, BITS = int(os.environ.get("GS", "32")), int(os.environ.get("BITS", "4"))
 SRC = "/home/debian/phone-v81/moss/models/moss_image_sft_bf16.safetensors"
 D, H, HD, FF, NB = 3072, 24, 128, 8192, 42
 dev = "cuda" if torch.cuda.is_available() else "cpu"

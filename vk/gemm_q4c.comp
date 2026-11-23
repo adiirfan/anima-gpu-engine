@@ -1,0 +1,113 @@
+#version 450
+// gemm_q8c.comp for 4-bit weights with two-level scales (tools/pack_qwen.py q4k): each strip of 32 inputs of an
+// output holds 16 bytes (byte j: input j in the low half, input 16 + j in the high half, signed -8..7) and one
+// whole-number sub-scale sc (1..15, one byte, [K/32][M]); SW is the fp32 scale per 256 inputs. Before each 32-input
+// step the work group expands its SN x TN outputs' strips into int8 q * sc (|q * sc| <= 120) in shared memory, once
+// for its SM rows of subgroups (2 x 1 was fastest on the Adreno 840: the expansion is shared by 128 rows), and the
+// matrix hardware loads the weights from there; the per-256 scaling is as in gemm_q8c:
+//   r[n][m] = sum over blocks b of GS inputs: SX[b][n] * SW[b][m] * (X[n, block b] . (q * sc)[m, block b])
+// The expanded weights are an int8 array on purpose: the Adreno driver reads a matrix out of a uint array with the
+// offset and stride in bytes, not in words as the rule book says, so a word array would break on one driver or another.
+// Only the plain endings and 4 (SwiGLU) are here. M a multiple of TN * SN, K of GS, GS of 32; row groups past Npad idle.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+
+layout(constant_id = 0) const uint TM = 64;
+layout(constant_id = 1) const uint TN = 32;
+layout(constant_id = 2) const uint SM = 1;
+layout(constant_id = 3) const uint SN = 2;
+layout(constant_id = 4) const uint SG = 64;
+layout(constant_id = 5) const uint EPI = 0;
+layout(local_size_x_id = 6) in;   // SM * SN * SG
+const uint TK = 32;
+
+layout(std430, binding = 0) readonly buffer XB { int8_t X[]; };
+layout(std430, binding = 1) readonly buffer WB { uint WN[]; };      // [K/32][M] strips of 16 bytes (4 words)
+layout(std430, binding = 2) readonly buffer SXB { float SX[]; };
+layout(std430, binding = 3) readonly buffer SWB { float SW[]; };
+layout(std430, binding = 4) buffer YB { float16_t YH[]; };
+layout(std430, binding = 5) buffer RB { float RES[]; };
+layout(std430, binding = 6) readonly buffer GB { float GATE[]; };
+layout(std430, binding = 7) readonly buffer BB { float BIAS[]; };
+layout(std430, binding = 8) readonly buffer SCB { uint8_t SC[]; };  // [K/32][M]
+layout(push_constant) uniform PC { uint N, Npad, M, K, ldy, cen, GS; } p;
+#include "epi.glsl"
+
+const uint PER = TM * TN / SG;
+shared int tile[SM * SN * TM * TN];
+shared float sxs[SM * SN * TM];
+shared int8_t wsh[SN * TN * TK];   // the work group's expanded weights: SN x TN outputs x 32 inputs
+
+#define ACCI coopmat<int, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>
+
+void main() {
+    const uint sg = gl_SubgroupID, t = gl_SubgroupInvocationID;
+    const uint n0 = (gl_WorkGroupID.y * SM + sg / SN) * TM, m0 = (gl_WorkGroupID.x * SN + sg % SN) * TN;
+    const uint tb = sg * TM * TN, sb = sg * TM, gm0 = gl_WorkGroupID.x * SN * TN;
+    const bool live = n0 < p.Npad;   // the work group's last rows of subgroups can fall past the padded rows
+    const uint col = t % TN, row0 = t / TN, rstep = SG / TN;
+    float acc[PER];
+    for (uint i = 0; i < PER; i++) acc[i] = 0.0;
+    for (uint k0 = 0, b = 0; k0 < p.K; k0 += p.GS, b++) {
+        ACCI part = ACCI(0);
+        for (uint k = k0; k < k0 + p.GS; k += TK) {
+            // expand, shared by the work group's SM rows of subgroups: unit u = output o (SN * TN of them), half h
+            // (inputs 0..15 from the low halves of the strip's bytes, 16..31 from the high), quarter c (8 inputs,
+            // 2 words): 4 units per output
+            barrier();   // the previous step's loads from wsh are done
+            for (uint u = gl_LocalInvocationIndex; u < SN * TN * 4; u += SM * SN * SG) {
+                const uint o = u >> 2, h = (u >> 1) & 1u, c = u & 1u, s = (k / TK) * p.M + gm0 + o;
+                const int sc = int(SC[s]);
+                const uint sh = h * 4u;
+                for (uint e = 0; e < 2; e++) {
+                    const uint x = WN[s * 4u + c * 2u + e];
+                    const uint d = o * TK + h * 16u + c * 8u + e * 4u;
+                    for (uint j = 0; j < 4; j++)
+                        wsh[d + j] = int8_t((int(((x >> (j * 8u + sh)) & 15u) << 28) >> 28) * sc);
+                }
+            }
+            barrier();
+            if (!live) continue;
+            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a;
+            coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> w;
+            coopMatLoad(a, X, ((k / TK) * p.Npad + n0) * TK, TK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(w, wsh, (sg % SN) * TN * TK, TK, gl_CooperativeMatrixLayoutColumnMajor);
+            part = coopMatMulAdd(a, w, part);
+        }
+        if (!live) continue;
+        for (uint r = t; r < TM; r += SG) sxs[sb + r] = SX[b * p.Npad + n0 + r];
+        coopMatStore(part, tile, tb, TN, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        const float sw = SW[b * p.M + m0 + col];
+        for (uint i = 0; i < PER; i++)
+            acc[i] = fma(float(tile[tb + t + i * SG]) * sxs[sb + row0 + i * rstep], sw, acc[i]);
+        subgroupBarrier();
+    }
+    if (!live) return;
+    if (EPI == 4) {
+        // SwiGLU: outputs as [gate 8][up 8] per 16; gate columns meet their up columns through the shared tile
+        for (uint i = 0; i < PER; i++)
+            tile[tb + t + i * SG] = floatBitsToInt(acc[i] + (p.cen != 0u ? BIAS[m0 + col] : 0.0));
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        if (col % 16 < 8)
+            for (uint i = 0; i < PER; i++) {
+                const uint n = n0 + row0 + i * rstep;
+                const float g = intBitsToFloat(tile[tb + t + i * SG]), u = intBitsToFloat(tile[tb + t + 8 + i * SG]);
+                if (n < p.N) YH[n * p.ldy + (m0 + col) / 16 * 8 + col % 16] = float16_t(g / (1.0 + exp(-g)) * u);
+            }
+        return;
+    }
+    for (uint i = 0; i < PER; i++) {
+        const uint n = n0 + row0 + i * rstep;
+        if (n < p.N) epi(n, m0 + col, acc[i]);
+    }
+}

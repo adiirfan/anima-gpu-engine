@@ -1,0 +1,21 @@
+#version 450
+// RES[n][k] += A[n][k] / rms(A[n]) * W[k] (Fibo: every layer's output is RMS-normed, scaled and added; eps 1e-6).
+// A fp16 rows (row stride ld), RES fp32 [n][D]; one work group of 64 per row.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer AB { f16vec4 A[]; };
+layout(std430, binding = 1) buffer RB { vec4 RES[]; };
+layout(std430, binding = 2) readonly buffer WB { vec4 W[]; };
+layout(push_constant) uniform PC { uint N, D, ld; } p;
+shared float red[64];
+void main() {
+    const uint l = gl_LocalInvocationID.x, n = gl_WorkGroupID.x;
+    const uint a0 = n * (p.ld / 4), r0 = n * (p.D / 4), D4 = p.D / 4;
+    float s = 0.0;
+    for (uint c = l; c < D4; c += 64) { const vec4 v = vec4(A[a0 + c]); s += dot(v, v); }
+    red[l] = s; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] += red[l + w]; barrier(); }
+    const float r = inversesqrt(red[0] / float(p.D) + 1e-6);
+    for (uint c = l; c < D4; c += 64) RES[r0 + c] += vec4(A[a0 + c]) * r * W[c];
+}

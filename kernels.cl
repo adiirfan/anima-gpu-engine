@@ -739,7 +739,7 @@ inline int dot_acc_sat_4x8packed_ss_int(uint a, uint b, int acc) {
 #define W4 0
 #endif
 #ifndef QKC
-#define QKC 128
+#define QKC (GS > 128 ? GS : 128)   // inputs staged per pass: whole scale blocks
 #endif
 // EPI 4: SwiGLU. The weight rows are stored [gate 8][up 8] per 16 outputs, so each item can finish
 // silu(gate) * up itself and write M/2 outputs.

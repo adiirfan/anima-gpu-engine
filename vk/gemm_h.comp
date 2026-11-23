@@ -1,0 +1,88 @@
+#version 450
+// fp16 multiply, fp32 sums: r[z][n][m] = X[z][n][:] . W[z][m][:]   (WT 1: W stored [K][M], i.e. r = X . W)
+// Batched over z (attention heads). Strides in elements (multiples of 4); K a multiple of BK. Endings as epi.glsl.
+// A work group computes BM x BN; each thread TM x TN of it, rows and columns strided across the tile.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+
+layout(constant_id = 0) const uint BM = 64;
+layout(constant_id = 1) const uint BN = 64;
+layout(constant_id = 2) const uint BK = 16;
+layout(constant_id = 3) const uint TM = 4;
+layout(constant_id = 4) const uint TN = 4;
+layout(constant_id = 5) const uint WT = 0;
+layout(constant_id = 6) const uint EPI = 0;
+layout(local_size_x_id = 7) in;   // (BM / TM) * (BN / TN)
+
+layout(std430, binding = 0) readonly buffer XB { f16vec4 X[]; };
+layout(std430, binding = 1) readonly buffer WB { f16vec4 W[]; };
+layout(std430, binding = 2) buffer YB { float16_t YH[]; };
+layout(std430, binding = 3) buffer RB { float RES[]; };
+layout(std430, binding = 4) readonly buffer GB { float GATE[]; };
+layout(std430, binding = 5) readonly buffer BB { float BIAS[]; };
+layout(push_constant) uniform PC { uint N, M, K, ldx, ldw, ldy, bsx, bsw, bsy, cen; } p;
+
+// epi.glsl with the batch offset folded into the output index
+float erf_(float x) {
+    const float s = sign(x); x = abs(x);
+    const float t = 1.0 / (1.0 + 0.3275911 * x);
+    const float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return s * y;
+}
+void epiz(uint z, uint n, uint m, float r) {
+    if (p.cen != 0u) r += BIAS[m];
+    const uint o = z * p.bsy + n * p.ldy + m;
+    if (EPI == 0) YH[o] = float16_t(r);
+    else if (EPI == 1) YH[o] = float16_t(0.5 * r * (1.0 + erf_(r * 0.70710678)));
+    else if (EPI == 2) RES[o] += r * GATE[m];
+    else RES[o] = r;
+}
+
+shared float16_t sx[BK * BM];
+shared float16_t sw[BK * BN];
+
+void main() {
+    const uint RT = BM / TM, CT = BN / TN, NT = RT * CT;
+    const uint tid = gl_LocalInvocationID.x, ty = tid / CT, tx = tid % CT;
+    const uint z = gl_WorkGroupID.z, n0 = gl_WorkGroupID.y * BM, m0 = gl_WorkGroupID.x * BN;
+    const uint BK4 = BK / 4, BN4 = BN / 4;
+    float acc[TM][TN];
+    for (uint i = 0; i < TM; i++) for (uint j = 0; j < TN; j++) acc[i][j] = 0.0;
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        for (uint e = tid; e < BM * BK4; e += NT) {
+            const uint r = e / BK4, c = e % BK4, n = n0 + r;
+            const f16vec4 v = n < p.N ? X[(z * p.bsx + n * p.ldx + k0) / 4 + c] : f16vec4(0);
+            sx[(4 * c) * BM + r] = v.x; sx[(4 * c + 1) * BM + r] = v.y; sx[(4 * c + 2) * BM + r] = v.z; sx[(4 * c + 3) * BM + r] = v.w;
+        }
+        if (WT == 0) {
+            for (uint e = tid; e < BN * BK4; e += NT) {
+                const uint r = e / BK4, c = e % BK4, m = m0 + r;
+                const f16vec4 v = m < p.M ? W[(z * p.bsw + m * p.ldw + k0) / 4 + c] : f16vec4(0);
+                sw[(4 * c) * BN + r] = v.x; sw[(4 * c + 1) * BN + r] = v.y; sw[(4 * c + 2) * BN + r] = v.z; sw[(4 * c + 3) * BN + r] = v.w;
+            }
+        } else {
+            for (uint e = tid; e < BK * BN4; e += NT) {
+                const uint kr = e / BN4, c = e % BN4, m = m0 + 4 * c;
+                const f16vec4 v = m < p.M ? W[(z * p.bsw + (k0 + kr) * p.ldw + m) / 4] : f16vec4(0);
+                sw[kr * BN + 4 * c] = v.x; sw[kr * BN + 4 * c + 1] = v.y; sw[kr * BN + 4 * c + 2] = v.z; sw[kr * BN + 4 * c + 3] = v.w;
+            }
+        }
+        barrier();
+        for (uint k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            for (uint i = 0; i < TM; i++) a[i] = float(sx[k * BM + ty + i * RT]);
+            for (uint j = 0; j < TN; j++) b[j] = float(sw[k * BN + tx + j * CT]);
+            for (uint i = 0; i < TM; i++) for (uint j = 0; j < TN; j++) acc[i][j] = fma(a[i], b[j], acc[i][j]);
+        }
+        barrier();
+    }
+    for (uint i = 0; i < TM; i++) {
+        const uint n = n0 + ty + i * RT;
+        if (n >= p.N) continue;
+        for (uint j = 0; j < TN; j++) {
+            const uint m = m0 + tx + j * CT;
+            if (m < p.M) epiz(z, n, m, acc[i][j]);
+        }
+    }
+}

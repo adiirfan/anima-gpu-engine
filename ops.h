@@ -177,6 +177,20 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         kPVsm = kern(build(kslice("// ======== softmax inside"), o), "gemmlsm");
     }
     if (Q8) {
+        // the scale block size is read from the file (an 8-bit table of K inputs with K / GS scales per output), so
+        // 64- and 256-input files both just work; QGS overrides, the model's own default is the fallback
+        {
+            int fileGS = 0;
+            auto look = [&](const std::string &n, const std::string &kind, int K) {
+                if (fileGS || (kind != "q8" && kind != "q4")) return;
+                auto s = W.find(n + ".s"); auto ss = SW.find(n + ".s");
+                const int nb = s != W.end() ? s->second.K : ss != SW.end() ? ss->second.K : 0;
+                if (nb > 0 && K % nb == 0) fileGS = K / nb;
+            };
+            for (auto &kv : W) look(kv.first, kv.second.kind, kv.second.K);
+            for (auto &kv : SW) look(kv.first, kv.second.kind, kv.second.K);
+            if (fileGS && fileGS != QGS && !getenv("QGS")) { printf("8-bit scale blocks of %d inputs (from the file)\n", fileGS); QGS = fileGS; }
+        }
         if (getenv("QGS")) QGS = atoi(getenv("QGS"));
         if (getenv("QCFG")) sscanf(getenv("QCFG"), "%d,%d,%d", &QTNv, &QOBv, &QWGv);
         if (getenv("QT")) QTv = atoi(getenv("QT"));
@@ -191,7 +205,8 @@ static void init(int heads, int width, int maxTokens, int maxK) {
             snprintf(o, sizeof o, "-DGS=%d -DW4=1", QGS); kDeq4 = kern(build(qsrc, o), "deq8");
         }
         for (int e : {0, 1, 2, 3, 4}) {
-            snprintf(o, sizeof o, "-DEPI=%d -DGS=%d -DQTN=%d -DQOB=%d -DQWG=%d -DROT=%d -DSRC=0 -DCEN=%d -DGELU_TANH=%d -DSITU=%d", e, QGS, QTNv, QOBv, QWGv, rot, cenv, GELUT, SITU);
+            // the multiply stages QKC inputs at a time and needs whole scale blocks in each stage
+            snprintf(o, sizeof o, "-DEPI=%d -DGS=%d -DQTN=%d -DQOB=%d -DQWG=%d -DROT=%d -DSRC=0 -DCEN=%d -DGELU_TANH=%d -DSITU=%d -DQKC=%d", e, QGS, QTNv, QOBv, QWGv, rot, cenv, GELUT, SITU, std::max(128, QGS));
             kQ[e] = kern(build(qsrc, o), "gemmq");
             bool any4 = false; for (auto &kv : W) if (kv.second.kind == "q4") { any4 = true; break; }
             for (auto &kv : SW) if (kv.second.kind == "q4") { any4 = true; break; }
@@ -399,6 +414,7 @@ struct Streamer {
                 if (s->kind == "pk") w.m = img(s->M / 4, s->K / 2, s->src);   // STREAM_PK=1: fp16 blocks too
                 else if (s->kind == "q8") w.m = q8img(s->M, s->K, s->src);
                 else if (s->kind == "q4") w.m = q8img(s->M, s->K, s->src, 32);
+                else if (s->kind == "qsk") { auto v = qskScales(s->src, s->sub, s->M, s->K); w.m = buf(v.size() * 4, v.data()); }
                 else w.m = buf(s->bytes, s->src);
             }));
         }

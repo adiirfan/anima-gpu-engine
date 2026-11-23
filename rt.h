@@ -258,7 +258,18 @@ static std::string GPROG;
 // STREAM=1: the drawing blocks' big tables (8/4-bit weights and their scales, names "b<k>.*") stay in the file and are
 // turned into chip objects one block at a time just before use (ops.h Streamer), so a model bigger than the phone's
 // memory still runs. The file stays mapped; everything else loads at start as usual.
-struct SInfo { std::string kind; int M, K; const char *src; size_t bytes; };
+struct SInfo { std::string kind; int M, K; const char *src; size_t bytes; const char *sub = nullptr; };
+// "qsk" (2026-11-23, 4-bit files made for the Vulkan engine): a 4-bit table's scales come as one fp32 scale per 256
+// inputs ("<name>.s") and a whole-number sub-scale 0..15 per 32 inputs ("<name>.sc", kind q4sc, one byte each). This
+// engine multiplies them back into its usual per-32 scales (with the 1/16 its 4-bit kernels expect) as a table loads.
+static std::vector<float> qskScales(const char *sup, const char *sub, int M, int K32) {
+    std::vector<float> v((size_t)M * K32);
+    const float *d = (const float *)sup; const uint8_t *c = (const uint8_t *)sub;
+    const int K256 = K32 / 8;
+    for (int o = 0; o < M; o++) for (int b = 0; b < K32; b++)
+        v[(size_t)o * K32 + b] = d[(size_t)o * K256 + b / 8] * c[(size_t)o * K32 + b] / 16.0f;
+    return v;
+}
 static std::map<std::string, SInfo> SW;
 static bool STREAM = false;
 // STREAM_PK=1 (fp16 models on chips without a fast 8-bit dot product): a block's six big fp16 tables stream too, the
@@ -269,7 +280,7 @@ static bool pkStreamable(const std::string &n) {
     return false;
 }
 static bool streamedName(const std::string &n, const std::string &kind) {
-    return STREAM && n.size() > 2 && n[0] == 'b' && isdigit((unsigned char)n[1]) && (kind == "q8" || kind == "q4" || kind == "qs" ||
+    return STREAM && n.size() > 2 && n[0] == 'b' && isdigit((unsigned char)n[1]) && (kind == "q8" || kind == "q4" || kind == "qs" || kind == "qsk" ||
                                                                        (kind == "pk" && getenv("STREAM_PK") && pkStreamable(n)));
 }
 static std::string loadGGUF(const std::string &path, const std::function<bool(const std::string &)> &skip = nullptr) {
@@ -335,6 +346,12 @@ static std::string loadGGUF(const std::string &path, const std::function<bool(co
         for (size_t i = 1; i < dot; i++) if (!isdigit((unsigned char)n[i])) return n;
         return "b" + std::to_string(atoi(n.c_str() + 1) + (n[0] == 's' ? kleinND : 0)) + n.substr(dot);
     };
+    std::map<std::string, std::pair<const char *, int>> subs;   // "<name>.sc" sub-scales by table name "<name>.s"
+    for (auto &t : tis) {
+        auto k = kinds.find(t.name);
+        if (k != kinds.end() && std::get<0>(k->second) == "q4sc" && t.name.size() > 3)
+            subs[t.name.substr(0, t.name.size() - 1)] = {base + data + t.off, std::get<2>(k->second)};
+    }
     for (auto &t : tis) {
         if (skip && skip(t.name)) continue;
         auto k = kinds.find(t.name);
@@ -343,8 +360,12 @@ static std::string loadGGUF(const std::string &path, const std::function<bool(co
         if (!es) { fprintf(stderr, "GGUF tensor %s: type %u not supported\n", t.name.c_str(), t.type); exit(1); }
         Wt w{std::get<0>(k->second), std::get<1>(k->second), std::get<2>(k->second), nullptr};
         const char *src = base + data + t.off;
+        if (w.kind == "q4sc") continue;   // folded into the scales below
+        const char *sub = nullptr;
+        if (w.kind == "qs") { auto sc = subs.find(t.name); if (sc != subs.end()) { w.kind = "qsk"; sub = sc->second.first; w.K = sc->second.second; } }
         t.name = alias(t.name);
-        if (streamedName(t.name, w.kind)) { SW[t.name] = {w.kind, w.M, w.K, src, t.n * es}; continue; }
+        if (streamedName(t.name, w.kind)) { SW[t.name] = {w.kind, w.M, w.K, src, w.kind == "qsk" ? (size_t)w.M * w.K * 4 : t.n * es, sub}; continue; }
+        if (w.kind == "qsk") { auto v = qskScales(src, sub, w.M, w.K); w.m = buf(v.size() * 4, v.data()); W[t.name] = w; continue; }
         if (w.kind == "pk") w.m = img(w.M / 4, w.K / 2, src);
         else if (w.kind == "q8") w.m = q8img(w.M, w.K, src);
         else if (w.kind == "q4") w.m = q8img(w.M, w.K, src, 32);
@@ -362,6 +383,9 @@ static void refill(cl_command_queue lq, const SInfo &s, cl_mem m) {
         const char *d = q8layout(s.M, s.K, s.src, s.kind == "q4" ? 32 : 16, t, w, h);
         const size_t o[3] = {0, 0, 0}, r[3] = {(size_t)w, (size_t)h, 1};
         CK(clEnqueueWriteImage(lq, m, CL_TRUE, o, r, (size_t)w * 16, 0, d, 0, 0, 0));
+    } else if (s.kind == "qsk") {
+        auto v = qskScales(s.src, s.sub, s.M, s.K);
+        CK(clEnqueueWriteBuffer(lq, m, CL_TRUE, 0, v.size() * 4, v.data(), 0, 0, 0));
     } else if (s.kind == "pk") {   // fp16 packed weights: the file holds the image's texels row by row
         const size_t o[3] = {0, 0, 0}, r[3] = {(size_t)s.M / 4, (size_t)s.K / 2, 1};
         CK(clEnqueueWriteImage(lq, m, CL_TRUE, o, r, (size_t)s.M / 4 * 16, 0, s.src, 0, 0, 0));
@@ -390,6 +414,7 @@ static std::map<std::string, Wt> loadBlock(int b) {
             Wt w{s->kind, s->M, s->K, nullptr};
             if (s->kind == "q8") w.m = q8img(s->M, s->K, s->src);
             else if (s->kind == "q4") w.m = q8img(s->M, s->K, s->src, 32);
+            else if (s->kind == "qsk") { auto v = qskScales(s->src, s->sub, s->M, s->K); w.m = buf(v.size() * 4, v.data()); }
             else w.m = buf(s->bytes, s->src);
             return w;
         }));

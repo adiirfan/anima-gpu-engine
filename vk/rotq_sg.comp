@@ -1,0 +1,57 @@
+#version 450
+// rotq.comp without shared memory: the 64 threads of one subgroup (subgroup size must be 64) hold 4 consecutive
+// inputs each and do the 256-point rotation by swapping values between threads (stage 1 inside a thread, stages 4,
+// 16, 64 across threads 1, 4, 16 apart); the scale is a max over GS/4 neighbouring threads. Same numbers as rotq.comp.
+// SRC 1 also makes its own layer-norm statistics with subgroup sums when RS 1 (one 256-piece per token: x = token).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(constant_id = 0) const uint SRC = 1;
+layout(constant_id = 1) const uint CEN = 0;
+layout(constant_id = 2) const uint LB = 64;   // GS / 4: threads per scale block
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer RB { vec4 RES[]; };
+layout(std430, binding = 1) readonly buffer IB { f16vec4 IN[]; };
+layout(std430, binding = 2) readonly buffer SHB { vec4 SH[]; };
+layout(std430, binding = 3) readonly buffer SCB { vec4 SC[]; };
+layout(std430, binding = 4) readonly buffer MB { vec4 MU[]; };
+layout(std430, binding = 5) writeonly buffer QB { uint XQ[]; };
+layout(std430, binding = 6) writeonly buffer SB { float SXO[]; };
+layout(std430, binding = 7) readonly buffer STB { vec2 ST[]; };
+layout(push_constant) uniform PC { uint N, K, ld, col0, Npad, GS; float eps; } p;
+
+// the 4-point step: out_j = row j of [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] . (a0, a1, a2, a3)
+float bf(uint j, float a0, float a1, float a2, float a3) {
+    return j == 0 ? a0 + a1 + a2 - a3 : j == 1 ? a0 + a1 - a2 + a3 : j == 2 ? a0 - a1 + a2 + a3 : -a0 + a1 + a2 + a3;
+}
+
+void main() {
+    const uint n = gl_WorkGroupID.x, g = gl_WorkGroupID.y, l = gl_LocalInvocationID.x, K4 = p.K / 4;   // = the subgroup lane (one subgroup per work group); gl_SubgroupInvocationID read 0 for every thread here on the Adreno 840
+    const uint c4 = g * 64 + l;
+    vec4 v;
+    if (SRC == 1) {
+        const vec2 st = ST[n];
+        v = (RES[n * K4 + c4] - st.x) * st.y * (1.0 + SC[c4]) + SH[c4];
+    } else v = vec4(IN[(n * p.ld + p.col0) / 4 + c4]);
+    if (CEN == 1) v -= MU[c4];
+    // stage 1: the thread's own four
+    v = vec4(bf(0, v.x, v.y, v.z, v.w), bf(1, v.x, v.y, v.z, v.w), bf(2, v.x, v.y, v.z, v.w), bf(3, v.x, v.y, v.z, v.w));
+    // stages 4, 16, 64: the four threads t apart that share my element positions (whole vec4s are swapped: picking
+    // components by a loop counter miscompiled on the Adreno 840)
+    for (uint t = 1; t < 64; t *= 4) {
+        const uint j = (l / t) % 4, base = l - j * t;
+        const vec4 a0 = subgroupShuffle(v, base), a1 = subgroupShuffle(v, base + t);
+        const vec4 a2 = subgroupShuffle(v, base + 2 * t), a3 = subgroupShuffle(v, base + 3 * t);
+        v = j == 0 ? a0 + a1 + a2 - a3 : j == 1 ? a0 + a1 - a2 + a3 : j == 2 ? a0 - a1 + a2 + a3 : -a0 + a1 + a2 + a3;
+    }
+    v *= 1.0 / 16.0;
+    float m = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    for (uint d = 1; d < LB; d *= 2) m = max(m, subgroupShuffleXor(m, d));   // max over the LB threads of my block
+    m = max(m, 1e-12);
+    const ivec4 q = clamp(ivec4(roundEven(v * (127.0 / m))), ivec4(-128), ivec4(127));
+    const uint k = g * 256 + 4 * l;
+    XQ[((k / 32) * p.Npad + n) * 8 + (k % 32) / 4] = uint(q.x & 255) | (uint(q.y & 255) << 8) | (uint(q.z & 255) << 16) | (uint(q.w & 255) << 24);
+    if (l % LB == 0) SXO[(k / p.GS) * p.Npad + n] = m / 127.0;
+}

@@ -1,0 +1,63 @@
+#version 450
+// The engine's 8-bit multiply with the 4 x 8-bit dot product instruction (chips without matrix hardware, and desktop
+// cards for testing). Same inputs and result as gemm_q8c.comp. A work group of 256 threads computes a 64 x 64 tile,
+// each thread 4 x 4 outputs strided by 16; one 32-input strip of X and W at a time goes through shared memory as
+// [uint within strip][row]. Npad and M must be multiples of 64, K of GS, GS of 32.
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+
+layout(constant_id = 0) const uint EPI = 0;
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XB { uint X[]; };
+layout(std430, binding = 1) readonly buffer WB { uint W[]; };
+layout(std430, binding = 2) readonly buffer SXB { float SX[]; };
+layout(std430, binding = 3) readonly buffer SWB { float SW[]; };
+layout(std430, binding = 4) buffer YB { float16_t YH[]; };
+layout(std430, binding = 5) buffer RB { float RES[]; };
+layout(std430, binding = 6) readonly buffer GB { float GATE[]; };
+layout(std430, binding = 7) readonly buffer BB { float BIAS[]; };
+layout(push_constant) uniform PC { uint N, Npad, M, K, ldy, cen, GS; } p;
+#include "epi.glsl"
+
+shared uint xs[8 * 64];
+shared uint ws[8 * 64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, ty = tid / 16, tx = tid % 16;
+    const uint n0 = gl_WorkGroupID.y * 64, m0 = gl_WorkGroupID.x * 64;
+    int acc[4][4];
+    float f[4][4];
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++) { acc[i][j] = 0; f[i][j] = 0.0; }
+    const uint SPB = p.GS / 32;   // strips per scale block
+    for (uint s = 0; s < p.K / 32; s++) {
+        for (uint e = tid; e < 512; e += 256) {   // 64 rows x 8 uints, contiguous in the strip
+            xs[(e % 8) * 64 + e / 8] = X[(s * p.Npad + n0) * 8 + e];
+            ws[(e % 8) * 64 + e / 8] = W[(s * p.M + m0) * 8 + e];
+        }
+        barrier();
+        for (uint u = 0; u < 8; u++) {
+            uint a[4], b[4];
+            for (uint i = 0; i < 4; i++) a[i] = xs[u * 64 + ty + 16 * i];
+            for (uint j = 0; j < 4; j++) b[j] = ws[u * 64 + tx + 16 * j];
+            for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++) acc[i][j] += dotPacked4x8EXT(int(a[i]), int(b[j]));   // int arguments: signed bytes
+        }
+        barrier();
+        if ((s + 1) % SPB == 0) {
+            const uint blk = s / SPB;
+            for (uint i = 0; i < 4; i++) {
+                const float sx = SX[blk * p.Npad + n0 + ty + 16 * i];
+                for (uint j = 0; j < 4; j++) {
+                    f[i][j] = fma(float(acc[i][j]) * sx, SW[blk * p.M + m0 + tx + 16 * j], f[i][j]);
+                    acc[i][j] = 0;
+                }
+            }
+        }
+    }
+    for (uint i = 0; i < 4; i++) {
+        const uint n = n0 + ty + 16 * i;
+        if (n < p.N) for (uint j = 0; j < 4; j++) epi(n, m0 + tx + 16 * j, f[i][j]);
+    }
+}

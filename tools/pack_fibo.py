@@ -58,7 +58,31 @@ def q4(name, w, b=None):
     put(name, "q4", by.permute(1, 0, 2).contiguous().cpu().numpy().view(np.int8), M, K)
     put(name + ".s", "qs", (s / 16).view(M, K // GS).contiguous().cpu().numpy().astype(np.float32), M, K // GS)
     if b is not None: f32(name + ".b", b)
-qb = q4 if BITS == 4 else q8
+def q4k(name, w, b=None):
+    """4-bit with two-level scales for the Vulkan engine (Q4K=1): as pack_qwen.py's q4k"""
+    M, K = w.shape
+    t = rotw(w).view(M, K // 256, 8, 32)
+    s32 = t.abs().amax(-1).clamp_min(1e-12) / 7
+    best = None
+    for fct in (1.0, 0.95, 0.9, 0.85, 0.8, 0.75):
+        d = s32.amax(-1, keepdim=True) / 15 * fct
+        sc = (s32 / d).round().clamp(1, 15)
+        st = (d * sc).unsqueeze(-1)
+        q = (t / st).round().clamp(-8, 7)
+        e = ((q * st - t) ** 2).sum((-1, -2))
+        if best is None: best = [e, d, sc, q]
+        else:
+            gm = e < best[0]
+            best = [torch.where(gm, e, best[0]), torch.where(gm[..., None], d, best[1]), torch.where(gm[..., None], sc, best[2]),
+                    torch.where(gm[..., None, None], q, best[3])]
+    _, d, sc, q = best
+    q = q.to(torch.int16).view(M, K // 32, 2, 16)
+    by = ((q[:, :, 0] & 15) | ((q[:, :, 1] & 15) << 4)).to(torch.uint8)
+    put(name, "q4", by.permute(1, 0, 2).contiguous().cpu().numpy().view(np.int8), M, K)
+    put(name + ".s", "qs", d.view(M, K // 256).contiguous().cpu().numpy().astype(np.float32), M, K // 256)
+    put(name + ".sc", "q4sc", sc.to(torch.uint8).view(M, K // 32).contiguous().cpu().numpy().view(np.int8), M, K // 32)
+    if b is not None: f32(name + ".b", b)
+qb = (q4k if os.environ.get("Q4K") else q4) if BITS == 4 else q8
 def pair_rows(gate, up):
     n = gate.shape[0]
     return torch.stack([gate.view(n // 8, 8, -1), up.view(n // 8, 8, -1)], 1).reshape(2 * n, -1)

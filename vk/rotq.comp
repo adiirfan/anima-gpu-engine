@@ -1,0 +1,63 @@
+#version 450
+// Input side of the 8-bit multiplies, one token x 256 inputs per work group of 64 threads (x = token, y = which 256;
+// the OpenCL rotq's numbers, but every 256-input piece in parallel):
+//   SRC 1: v = (RES[n] - mean) * rstd * (1 + SC) + SH, mean / rstd from ST (rowstats.comp)   SRC 0: v = IN[n][col0 ..] (fp16)
+//   CEN 1: v -= MU (the layer's input average, its W.mu comes back as the multiply's bias)
+// then per 256 inputs the same 256-point rotation the weights were packed with (radix-4 butterflies at strides
+// 1, 4, 16, 64 with the +,+,+,- pattern, / 16), one scale per GS inputs (max / 127), rounded to int8 (half to even).
+// Out: XQ strips [K/32][Npad][32] bytes (as uints), SXO block-major [K/GS][Npad].
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(constant_id = 0) const uint SRC = 1;
+layout(constant_id = 1) const uint CEN = 0;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer RB { vec4 RES[]; };
+layout(std430, binding = 1) readonly buffer IB { float16_t IN[]; };
+layout(std430, binding = 2) readonly buffer SHB { vec4 SH[]; };
+layout(std430, binding = 3) readonly buffer SCB { vec4 SC[]; };
+layout(std430, binding = 4) readonly buffer MB { vec4 MU[]; };
+layout(std430, binding = 5) writeonly buffer QB { uint XQ[]; };
+layout(std430, binding = 6) writeonly buffer SB { float SXO[]; };
+layout(std430, binding = 7) readonly buffer STB { vec2 ST[]; };
+layout(push_constant) uniform PC { uint N, K, ld, col0, Npad, GS; float eps; } p;
+
+shared float buf[256];
+shared float red[64];
+
+void main() {
+    const uint n = gl_WorkGroupID.x, g = gl_WorkGroupID.y, l = gl_LocalInvocationID.x, K4 = p.K / 4;
+    float mean = 0.0, rstd = 1.0;
+    if (SRC == 1) { const vec2 st = ST[n]; mean = st.x; rstd = st.y; }
+    const uint LB = p.GS / 4;
+    {
+        const uint c4 = g * 64 + l;
+        vec4 v;
+        if (SRC == 1) v = (RES[n * K4 + c4] - mean) * rstd * (1.0 + SC[c4]) + SH[c4];
+        else {
+            const uint o = n * p.ld + p.col0 + 4 * c4;
+            v = vec4(float(IN[o]), float(IN[o + 1]), float(IN[o + 2]), float(IN[o + 3]));
+        }
+        if (CEN == 1) v -= MU[c4];
+        buf[4 * l] = v.x; buf[4 * l + 1] = v.y; buf[4 * l + 2] = v.z; buf[4 * l + 3] = v.w;
+        barrier();
+        for (uint s = 1; s < 256; s *= 4) {
+            const uint i0 = (l / s) * s * 4 + (l % s);
+            const float a0 = buf[i0], a1 = buf[i0 + s], a2 = buf[i0 + 2 * s], a3 = buf[i0 + 3 * s];
+            buf[i0] = a0 + a1 + a2 - a3;
+            buf[i0 + s] = a0 + a1 - a2 + a3;
+            buf[i0 + 2 * s] = a0 - a1 + a2 + a3;
+            buf[i0 + 3 * s] = -a0 + a1 + a2 + a3;
+            barrier();
+        }
+        v = vec4(buf[4 * l], buf[4 * l + 1], buf[4 * l + 2], buf[4 * l + 3]) * (1.0 / 16.0);
+        red[l] = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+        barrier();
+        const uint b0 = (l / LB) * LB;
+        float m = 1e-12;
+        for (uint i = 0; i < LB; i++) m = max(m, red[b0 + i]);
+        const ivec4 q = clamp(ivec4(roundEven(v * (127.0 / m))), ivec4(-128), ivec4(127));
+        const uint k = g * 256 + 4 * l;
+        XQ[((k / 32) * p.Npad + n) * 8 + (k % 32) / 4] = uint(q.x & 255) | (uint(q.y & 255) << 8) | (uint(q.z & 255) << 16) | (uint(q.w & 255) << 24);
+        if (l == b0) SXO[(k / p.GS) * p.Npad + n] = m / 127.0;
+    }
+}

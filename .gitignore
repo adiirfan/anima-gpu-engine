@@ -13,3 +13,8 @@ tools/todo_sim.py
 rt_part1.txt
 x86icd/
 reader/texttaps_x86
+# the Vulkan engine's built programs and generated shader arrays (vk/build.sh makes them)
+vk/gen/
+vk/*_x86
+vk/*_android
+ugpu_x86_new

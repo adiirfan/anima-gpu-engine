@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the engine for phones and put it in the Anima app: the program as jniLibs/arm64-v8a/libugpu.so (Android only
 # lets apps run programs from their library folder, and only files named lib*.so get unpacked there), its chip code
-# (kernels.cl, tae.cl) as assets/ugpu/, and Fibo's prompt reader as libfibotaps.so. Usage: tools/build_app.sh [app folder, default ~/anima-android]
+# (kernels.cl, tae.cl) as assets/ugpu/, the Vulkan engine as libvkugpu.so, and Fibo's prompt reader as libfibotaps.so. Usage: tools/build_app.sh [app folder, default ~/anima-android]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=${1:-/home/debian/anima-android}
@@ -10,6 +10,10 @@ mkdir -p "$APP/app/src/main/jniLibs/arm64-v8a" "$APP/app/src/main/assets/ugpu"
 timeout 300 "$CXX" -O2 -std=c++17 -static-libstdc++ -I/home/debian/ugpu/third_party/OpenCLHeaders \
     main.cpp -o "$APP/app/src/main/jniLibs/arm64-v8a/libugpu.so" -L/home/debian/ugpu/third_party/lib -lOpenCL
 cp kernels.cl tae.cl "$APP/app/src/main/assets/ugpu/"
+# the Vulkan engine (vk/, the models it knows) as libvkugpu.so: shaders are built into the program
+(cd vk && bash build.sh >/dev/null)
+rm -f "$APP/app/src/main/jniLibs/arm64-v8a/libvkanima.so"
+cp vk/vkugpu_android "$APP/app/src/main/jniLibs/arm64-v8a/libvkugpu.so"
 # Fibo's prompt reader (reader/fibotaps.cpp), linked against the app's own llama.cpp libraries (built from
 # ~/llamacpp-hexagon: the headers must be that same version)
 L=/home/debian/llamacpp-hexagon

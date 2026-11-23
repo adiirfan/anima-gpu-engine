@@ -1,0 +1,44 @@
+#version 450
+// Softmax along rows of the fp16 score table S [heads][N][LK], in place (bias on the last key, keys from kvalid on
+// ignored). RPW rows per work group of 64 x RPW threads; each thread keeps its VPL x 4 scores in registers, so the row
+// is read once and written once. LK must be a multiple of 4 and at most 256 x VPL.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(constant_id = 0) const uint VPL = 4;
+layout(constant_id = 1) const uint RPW = 4;
+layout(constant_id = 2) const uint CAUSAL = 0;   // 1: row n sees only keys 0..n (Qwen-Image's prompt pass)
+layout(local_size_x = 64, local_size_y_id = 1) in;
+layout(std430, binding = 0) buffer SB { f16vec4 S[]; };
+layout(push_constant) uniform PC { uint N, LK, kvalid; float bias; } p;
+shared float red[RPW][64];
+void main() {
+    const uint l = gl_LocalInvocationID.x, r = gl_LocalInvocationID.y;
+    const uint n = gl_WorkGroupID.x * RPW + r, h = gl_WorkGroupID.y;
+    const bool live = n < p.N;
+    const uint row = (h * p.N + min(n, p.N - 1)) * (p.LK / 4), L4 = p.LK / 4;
+    vec4 v[VPL];
+    float m = -1e30;
+    for (uint i = 0; i < VPL; i++) {
+        const uint j4 = l + i * 64;
+        v[i] = j4 < L4 ? vec4(S[row + j4]) : vec4(-1e30);
+        for (uint e = 0; e < 4; e++) {
+            const uint j = 4 * j4 + e;
+            if (j == p.LK - 1) v[i][e] += p.bias;
+            if (j >= p.kvalid || (CAUSAL != 0u && j > n)) v[i][e] = -1e30;
+        }
+        m = max(m, max(max(v[i].x, v[i].y), max(v[i].z, v[i].w)));
+    }
+    red[r][l] = m; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[r][l] = max(red[r][l], red[r][l + w]); barrier(); }
+    m = red[r][0]; barrier();
+    float s = 0.0;
+    for (uint i = 0; i < VPL; i++) { v[i] = exp(v[i] - m); s += v[i].x + v[i].y + v[i].z + v[i].w; }
+    red[r][l] = s; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[r][l] += red[r][l + w]; barrier(); }
+    const float inv = 1.0 / red[r][0];
+    if (!live) return;
+    for (uint i = 0; i < VPL; i++) {
+        const uint j4 = l + i * 64;
+        if (j4 < L4) S[row + j4] = f16vec4(v[i] * inv);
+    }
+}

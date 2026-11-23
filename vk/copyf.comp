@@ -1,0 +1,7 @@
+#version 450
+// DST[i] = SRC[i] for i < n (snapshots of the residual stream for checking)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer SB { float S[]; };
+layout(std430, binding = 1) writeonly buffer DB { float D[]; };
+layout(push_constant) uniform PC { uint n; } p;
+void main() { const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u; if (i < p.n) D[i] = S[i]; }

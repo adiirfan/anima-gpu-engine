@@ -1,0 +1,38 @@
+#version 450
+// Attention inputs, one (token, head) per work group of 128 threads (one channel each):
+//   NORM 1: x * rsqrt(mean(x^2) + 1e-6) * w * scale (q: scale 1/sqrt(128); k: 1), then ROPE 1: x P + x[c ^ 64] Q
+//   NORM 0: plain copy (v)
+//   FULL 1 (Wan): the norm spans the whole width - 1 / rms per row from RS (rowrms16.comp), weights w[128 h + c]
+// In: fp16 [N][ld] from column col0 (head h at col0 + 128 h). Out: fp16 [heads][outN][128].
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(constant_id = 0) const uint NORM = 1;
+layout(constant_id = 1) const uint ROPE = 1;
+layout(constant_id = 2) const uint FULL = 0;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer IB { float16_t IN[]; };
+layout(std430, binding = 1) readonly buffer WB { float w[]; };
+layout(std430, binding = 2) readonly buffer PB { float P[]; };
+layout(std430, binding = 3) readonly buffer QB { float Q[]; };
+layout(std430, binding = 4) writeonly buffer OB { float16_t OUT[]; };
+layout(std430, binding = 5) readonly buffer SB { float RS[]; };
+layout(push_constant) uniform PC { uint N, ld, col0, outN; float scale; } p;
+shared float red[128];
+shared float val[128];
+void main() {
+    const uint n = gl_WorkGroupID.x, h = gl_WorkGroupID.y, c = gl_LocalInvocationID.x;
+    float a = float(IN[n * p.ld + p.col0 + h * 128 + c]);
+    if (NORM == 1) {
+        if (FULL == 1u) a *= w[h * 128 + c] * RS[n] * p.scale;
+        else {
+            red[c] = a * a; barrier();
+            for (uint s = 64; s > 0; s >>= 1) { if (c < s) red[c] += red[c + s]; barrier(); }
+            a *= w[c] * inversesqrt(red[0] / 128.0 + 1e-6) * p.scale;
+        }
+        if (ROPE == 1) {
+            val[c] = a; barrier();
+            a = a * P[n * 128 + c] + val[c ^ 64] * Q[n * 128 + c];
+        }
+    }
+    OUT[(h * p.outN + n) * 128 + c] = float16_t(a);
+}

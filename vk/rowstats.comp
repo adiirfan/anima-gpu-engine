@@ -1,0 +1,25 @@
+#version 450
+// Layer-norm statistics of each token of the residual stream: ST[n] = (mean, 1 / sqrt(variance + eps)).
+// One token per work group of 64 threads (two passes, as the OpenCL rotq).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer RB { vec4 RES[]; };
+layout(std430, binding = 1) writeonly buffer SB { vec2 ST[]; };
+layout(push_constant) uniform PC { uint N, K; float eps; } p;
+layout(constant_id = 0) const uint RMS = 0;   // 1: RMS norm statistics (mean 0, 1 / sqrt(mean square + eps))
+shared float red[64];
+float sum64(float v, uint l) {
+    red[l] = v; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] += red[l + w]; barrier(); }
+    const float r = red[0]; barrier();
+    return r;
+}
+void main() {
+    const uint n = gl_WorkGroupID.x, l = gl_LocalInvocationID.x, K4 = p.K / 4;
+    vec4 s4 = vec4(0);
+    for (uint c = l; c < K4; c += 64) s4 += RES[n * K4 + c];
+    const float mean = RMS == 1u ? 0.0 : sum64(s4.x + s4.y + s4.z + s4.w, l) / float(p.K);
+    vec4 v4 = vec4(0);
+    for (uint c = l; c < K4; c += 64) { const vec4 d = RES[n * K4 + c] - mean; v4 = fma(d, d, v4); }
+    const float rstd = inversesqrt(sum64(v4.x + v4.y + v4.z + v4.w, l) / float(p.K) + p.eps);
+    if (l == 0) ST[n] = vec2(mean, rstd);
+}

@@ -1,0 +1,18 @@
+#version 450
+// 1 / rms of K fp16 channels of each row (from column col0): RS[n] = 1 / sqrt(mean(x^2) + eps). Wan's whole-width
+// q / k norms (attnprep.comp FULL). One row per work group of 64 threads.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer IB { float16_t IN[]; };
+layout(std430, binding = 1) writeonly buffer SB { float RS[]; };
+layout(push_constant) uniform PC { uint N, ld, col0, K; float eps; } p;
+shared float red[64];
+void main() {
+    const uint n = gl_WorkGroupID.x, l = gl_LocalInvocationID.x;
+    float s = 0.0;
+    for (uint c = l; c < p.K; c += 64) { const float v = float(IN[n * p.ld + p.col0 + c]); s = fma(v, v, s); }
+    red[l] = s; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] += red[l + w]; barrier(); }
+    if (l == 0) RS[n] = inversesqrt(red[0] / float(p.K) + p.eps);
+}

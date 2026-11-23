@@ -1,0 +1,20 @@
+#version 450
+// rowstats.comp with subgroup sums: one token per subgroup, 4 tokens per work group of 256 threads.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 4) in;
+layout(std430, binding = 0) readonly buffer RB { vec4 RES[]; };
+layout(std430, binding = 1) writeonly buffer SB { vec2 ST[]; };
+layout(push_constant) uniform PC { uint N, K; float eps; } p;
+layout(constant_id = 0) const uint RMS = 0;   // 1: RMS norm statistics (mean 0, 1 / sqrt(mean square + eps))
+void main() {
+    const uint n = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.y, l = gl_LocalInvocationID.x, K4 = p.K / 4;
+    if (n >= p.N) return;
+    vec4 s4 = vec4(0);
+    for (uint c = l; c < K4; c += 64) s4 += RES[n * K4 + c];
+    const float mean = RMS == 1u ? 0.0 : subgroupAdd(s4.x + s4.y + s4.z + s4.w) / float(p.K);
+    vec4 v4 = vec4(0);
+    for (uint c = l; c < K4; c += 64) { const vec4 d = RES[n * K4 + c] - mean; v4 = fma(d, d, v4); }
+    const float rstd = inversesqrt(subgroupAdd(v4.x + v4.y + v4.z + v4.w) / float(p.K) + p.eps);
+    if (l == 0) ST[n] = vec2(mean, rstd);
+}

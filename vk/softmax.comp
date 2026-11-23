@@ -1,0 +1,25 @@
+#version 450
+// Softmax along each row of the fp16 score table S [heads][N][LK], in place: bias added to the last key, keys from
+// kvalid on ignored. One row (x = query, y = head) per work group of 64 threads.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer SB { float16_t S[]; };
+layout(push_constant) uniform PC { uint N, LK, kvalid; float bias; } p;
+shared float red[64];
+void main() {
+    const uint n = gl_WorkGroupID.x, h = gl_WorkGroupID.y, l = gl_LocalInvocationID.x;
+    const uint row = (h * p.N + n) * p.LK;
+    float m = -1e30;
+    for (uint j = l; j < p.kvalid; j += 64) m = max(m, float(S[row + j]) + (j == p.LK - 1 ? p.bias : 0.0));
+    red[l] = m; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] = max(red[l], red[l + w]); barrier(); }
+    m = red[0]; barrier();
+    float s = 0.0;
+    for (uint j = l; j < p.kvalid; j += 64) s += exp(float(S[row + j]) + (j == p.LK - 1 ? p.bias : 0.0) - m);
+    red[l] = s; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] += red[l + w]; barrier(); }
+    const float inv = 1.0 / red[0];
+    for (uint j = l; j < p.LK; j += 64)
+        S[row + j] = float16_t(j < p.kvalid ? exp(float(S[row + j]) + (j == p.LK - 1 ? p.bias : 0.0) - m) * inv : 0.0);
+}

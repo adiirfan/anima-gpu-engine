@@ -1,0 +1,27 @@
+#version 450
+// Y[n] (fp16) = layernorm(RES[n]) * (1 + SC) + SH, one token per work group of 64 threads.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer RB { float RES[]; };
+layout(std430, binding = 1) readonly buffer SHB { float SH[]; };
+layout(std430, binding = 2) readonly buffer SCB { float SC[]; };
+layout(std430, binding = 3) writeonly buffer YB { float16_t Y[]; };
+layout(push_constant) uniform PC { uint N, D; float eps; } p;
+shared float red[64];
+float sum64(float v, uint l) {
+    red[l] = v; barrier();
+    for (uint w = 32; w > 0; w >>= 1) { if (l < w) red[l] += red[l + w]; barrier(); }
+    const float r = red[0]; barrier();
+    return r;
+}
+void main() {
+    const uint n = gl_WorkGroupID.x, l = gl_LocalInvocationID.x;
+    float s = 0.0;
+    for (uint c = l; c < p.D; c += 64) s += RES[n * p.D + c];
+    const float mean = sum64(s, l) / float(p.D);
+    float v = 0.0;
+    for (uint c = l; c < p.D; c += 64) { const float d = RES[n * p.D + c] - mean; v = fma(d, d, v); }
+    const float rstd = inversesqrt(sum64(v, l) / float(p.D) + p.eps);
+    for (uint c = l; c < p.D; c += 64) Y[n * p.D + c] = float16_t((RES[n * p.D + c] - mean) * rstd * (1.0 + SC[c]) + SH[c]);
+}
