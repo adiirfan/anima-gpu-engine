@@ -1,0 +1,40 @@
+#version 450
+// Krea's text fusion: attention inside groups of grp consecutive rows (the 12 reader layers of one prompt token, or
+// all prompt rows), q / k RMS-normed with qw / kw (eps 1e-5), q scaled by 1 / sqrt(128), no rope. As kernels.cl's
+// grpattn. One (row, head) per work group of 128 threads, one channel each; keys one at a time with a running softmax.
+// In: fp16 [n1][ld], q / k / v of head h at columns qc / kc / vc + 128 h. Out: fp16 [n1][ldo], head h at 128 h.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer IB { float16_t X[]; };
+layout(std430, binding = 1) readonly buffer QWB { float qw[]; };
+layout(std430, binding = 2) readonly buffer KWB { float kw[]; };
+layout(std430, binding = 3) writeonly buffer OB { float16_t O[]; };
+layout(push_constant) uniform PC { uint n1, grp, ld, qc, kc, vc, ldo; } p;
+shared float ra[128], rb[128];
+
+void main() {
+    const uint n = gl_WorkGroupID.x, h = gl_WorkGroupID.y, c = gl_LocalInvocationID.x;
+    if (n >= p.n1) return;   // the whole work group leaves together
+    const uint g0 = n / p.grp * p.grp, g1 = min(g0 + p.grp, p.n1);
+    float q = float(X[n * p.ld + p.qc + h * 128 + c]);
+    ra[c] = q * q;
+    barrier();
+    for (uint w = 64; w > 0; w >>= 1) { if (c < w) ra[c] += ra[c + w]; barrier(); }
+    q *= qw[c] * inversesqrt(ra[0] / 128.0 + 1e-5) * 0.08838834764;
+    barrier();
+    float m = -1e30, l = 0.0, acc = 0.0;
+    for (uint j = g0; j < g1; j++) {
+        const float a = float(X[j * p.ld + p.kc + h * 128 + c]);
+        ra[c] = a * a; rb[c] = a * kw[c] * q;
+        barrier();
+        for (uint w = 64; w > 0; w >>= 1) { if (c < w) { ra[c] += ra[c + w]; rb[c] += rb[c + w]; } barrier(); }
+        const float s = rb[0] * inversesqrt(ra[0] / 128.0 + 1e-5);
+        barrier();
+        const float mn = max(m, s), corr = exp(m - mn), e = exp(s - mn);
+        l = l * corr + e;
+        acc = acc * corr + e * float(X[j * p.ld + p.vc + h * 128 + c]);
+        m = mn;
+    }
+    O[n * p.ldo + h * 128 + c] = float16_t(acc / l);
+}

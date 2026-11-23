@@ -1,5 +1,5 @@
 #version 450
-// y[m] = W[m] . act(x) + add[m]   (W fp16 [M][K]; act 1 = SiLU, 0 = none). One work group of 64 per output.
+// y[m] = W[m] . act(x) + add[m]   (W fp16 [M][K]; act 1 = SiLU, 2 = GELU (tanh form, Krea), 0 = none). One work group of 64 per output.
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 layout(local_size_x = 64) in;
@@ -15,6 +15,7 @@ void main() {
     for (uint k = t; k < p.K; k += 64) {
         float a = x[k];
         if (p.act == 1u) a = a / (1.0 + exp(-a));
+        else if (p.act == 2u) a = 0.5 * a * (1.0 + tanh(0.7978845608 * (a + 0.044715 * a * a * a)));
         s = fma(float(W[m * p.K + k]), a, s);
     }
     red[t] = s; barrier();

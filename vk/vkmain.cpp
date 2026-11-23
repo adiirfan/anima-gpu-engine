@@ -8,6 +8,7 @@
 #include "vk_wan.h"
 #include "vk_qwen.h"
 #include "vk_fibo.h"
+#include "vk_krea.h"
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <model.gguf> <ref dir> [loops] [WxH]\n", argv[0]); return 1; }
@@ -18,7 +19,7 @@ int main(int argc, char **argv) {
     if (argc > 4) sscanf(argv[4], "%dx%d", &PW, &PH);
     loadGGUF(argv[1]);
     if (MODEL.empty()) MODEL = "anima";   // the first Anima files carried no model name
-    if (MODEL != "anima" && MODEL != "klein" && MODEL != "moss" && MODEL != "wan" && MODEL != "qwen" && MODEL != "fibo") {
+    if (MODEL != "anima" && MODEL != "klein" && MODEL != "moss" && MODEL != "wan" && MODEL != "qwen" && MODEL != "fibo" && MODEL != "krea") {
         printf("Vulkan skipped: no Vulkan wiring for %s yet\n", MODEL.c_str());
         return 3;
     }
@@ -28,5 +29,6 @@ int main(int argc, char **argv) {
     if (MODEL == "moss") return moss::run(Rd, loops);
     if (MODEL == "qwen") return qwen::run(Rd, loops);
     if (MODEL == "fibo") return fibo::run(Rd, loops);
+    if (MODEL == "krea") return krea::run(Rd, loops);
     return wan::run(Rd, loops);
 }

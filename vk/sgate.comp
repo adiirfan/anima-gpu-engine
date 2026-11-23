@@ -1,0 +1,17 @@
+#version 450
+// Krea's gated attention output: Y[n][c] = O[n][c] * sigmoid(Gt[n][gc + c]), all fp16, c < D.
+// Launch (D / 256, n).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer OB { float16_t O[]; };
+layout(std430, binding = 1) readonly buffer GB { float16_t Gt[]; };
+layout(std430, binding = 2) writeonly buffer YB { float16_t Y[]; };
+layout(push_constant) uniform PC { uint D, ldo, ldg, gc; } p;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x, n = gl_WorkGroupID.y;
+    if (c >= p.D) return;
+    const float g = float(Gt[n * p.ldg + p.gc + c]);
+    Y[n * p.D + c] = float16_t(float(O[n * p.ldo + c]) / (1.0 + exp(-g)));
+}

@@ -18,6 +18,7 @@ ComfyUI will not load.
 | Qwen-Image 2.1 | `model_qwen.h` | `tools/pack_qwen.py` (8-bit or 4-bit) | text to picture, picture editing |
 | MOSS | `model_moss.h` | `tools/pack_moss.py` | text to picture |
 | Fibo | `model_fibo.h` | `tools/pack_fibo.py` | picture editing |
+| Krea 2 Turbo | `model_krea.h`, `vk/vk_krea.h` | `tools/pack_krea.py` (8-bit, 4-bit, or `Q4K=1` for the Vulkan layout) | text to picture |
 | Tiny decoders/encoders (TAE) | `model_tae.h`, `tae.cl` | `tools/pack_tae.py` | latents to pixels and back |
 
 The shared parts are in `ops.h` (matrix multiply with 8-bit and 4-bit weights, attention, norms, streaming of
