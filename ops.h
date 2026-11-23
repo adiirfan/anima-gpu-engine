@@ -30,6 +30,10 @@ static cl_mem rqB, rkB;
 // ---- 8-bit multiplies (ConvRot W8A8): activations rotated + rounded per token, int8 weights with block scales ----
 static int Q8 = 0, QGS = 64, QTv = 4, QTNv = 2, QOBv = 32, QWGv = 128;   // 2 x 32 beat 2 x 16 on a hot phone (MOSS)
 static cl_kernel kQ[5], kRotX, kRotLn, kRotLnL, kRmsAdd;
+// 4-bit tables whose scale blocks differ from the 8-bit ones' (Krea's Vulkan-layout file: 4-bit two-level scales
+// folded to blocks of 32, 8-bit tables in blocks of 256): their multiply and input rounding use QGS4
+static int QGS4 = 0;
+static cl_kernel kRotX4, kRotLn4, kRotLnL4;
 static int LNNEXT = 0;   // 1: the next lnq / normLinear uses a layer norm even in an RMSN model (Fibo's output layer)
 static cl_mem Xq, Sx;
 // 8-bit path: weights int8 ("q8") or int4 ("q4", two per byte, unpacked to int8 as they are staged)
@@ -182,16 +186,19 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         // the scale block size is read from the file (an 8-bit table of K inputs with K / GS scales per output), so
         // 64- and 256-input files both just work; QGS overrides, the model's own default is the fallback
         {
-            int fileGS = 0;
+            int gs8 = 0, gs4 = 0;   // the 8-bit tables' block size, the 4-bit ones'
             auto look = [&](const std::string &n, const std::string &kind, int K) {
-                if (fileGS || (kind != "q8" && kind != "q4")) return;
+                int &gs = kind == "q8" ? gs8 : gs4;
+                if (gs || (kind != "q8" && kind != "q4")) return;
                 auto s = W.find(n + ".s"); auto ss = SW.find(n + ".s");
                 const int nb = s != W.end() ? s->second.K : ss != SW.end() ? ss->second.K : 0;
-                if (nb > 0 && K % nb == 0) fileGS = K / nb;
+                if (nb > 0 && K % nb == 0) gs = K / nb;
             };
             for (auto &kv : W) look(kv.first, kv.second.kind, kv.second.K);
             for (auto &kv : SW) look(kv.first, kv.second.kind, kv.second.K);
+            const int fileGS = gs8 ? gs8 : gs4;
             if (fileGS && fileGS != QGS && !getenv("QGS")) { printf("8-bit scale blocks of %d inputs (from the file)\n", fileGS); QGS = fileGS; }
+            if (gs8 && gs4 && gs4 != gs8 && !getenv("QGS")) { QGS4 = gs4; printf("4-bit scale blocks of %d inputs\n", gs4); }
         }
         if (getenv("QGS")) QGS = atoi(getenv("QGS"));
         if (getenv("QCFG")) sscanf(getenv("QCFG"), "%d,%d,%d", &QTNv, &QOBv, &QWGv);
@@ -204,7 +211,7 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         const std::string qsrc = kslice("// ======== 8-bit path", "// ======== fused attention");
         if (A16) {
             snprintf(o, sizeof o, "-DGS=%d", QGS); kDeq = kern(build(qsrc, o), "deq8");
-            snprintf(o, sizeof o, "-DGS=%d -DW4=1", QGS); kDeq4 = kern(build(qsrc, o), "deq8");
+            snprintf(o, sizeof o, "-DGS=%d -DW4=1", QGS4 ? QGS4 : QGS); kDeq4 = kern(build(qsrc, o), "deq8");
         }
         for (int e : {0, 1, 2, 3, 4}) {
             // the multiply stages QKC inputs at a time and needs whole scale blocks in each stage
@@ -212,7 +219,10 @@ static void init(int heads, int width, int maxTokens, int maxK) {
             kQ[e] = kern(build(qsrc, o), "gemmq");
             bool any4 = false; for (auto &kv : W) if (kv.second.kind == "q4") { any4 = true; break; }
             for (auto &kv : SW) if (kv.second.kind == "q4") { any4 = true; break; }
-            if (any4) kQ4[e] = kern(build(qsrc, std::string(o) + " -DW4=1"), "gemmq");
+            if (any4 && QGS4) {
+                snprintf(o, sizeof o, "-DEPI=%d -DGS=%d -DQTN=%d -DQOB=%d -DQWG=%d -DROT=%d -DSRC=0 -DCEN=%d -DGELU_TANH=%d -DSITU=%d -DQKC=%d", e, QGS4, QTNv, QOBv, QWGv, rot, cenv, GELUT, SITU, std::max(128, QGS4));
+                kQ4[e] = kern(build(qsrc, std::string(o) + " -DW4=1"), "gemmq");
+            } else if (any4) kQ4[e] = kern(build(qsrc, std::string(o) + " -DW4=1"), "gemmq");
         }
         snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=0 -DQT=%d -DCEN=%d%s", QGS, rot, QTv, cenv, a16o);
         kRotX = kern(build(qsrc, o), "rotq");
@@ -220,7 +230,15 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         kRotLn = kern(build(qsrc, o), "rotq");
         snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=0%s", QGS, rot, QTv, cenv, a16o);
         kRotLnL = RMSN ? kern(build(qsrc, o), "rotq") : kRotLn;
-        Xq = img(MAXN, MAXK / (A16 ? 8 : 16)); Sx = buf((size_t)MAXN * (MAXK / QGS) * 4);
+        if (QGS4) {   // the same three roundings with the 4-bit tables' blocks
+            snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=0 -DQT=%d -DCEN=%d%s", QGS4, rot, QTv, cenv, a16o);
+            kRotX4 = kern(build(qsrc, o), "rotq");
+            snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=%d%s", QGS4, rot, QTv, cenv, RMSN, a16o);
+            kRotLn4 = kern(build(qsrc, o), "rotq");
+            snprintf(o, sizeof o, "-DEPI=0 -DGS=%d -DROT=%d -DSRC=1 -DQT=%d -DCEN=%d -DRMSN=0%s", QGS4, rot, QTv, cenv, a16o);
+            kRotLnL4 = RMSN ? kern(build(qsrc, o), "rotq") : kRotLn4;
+        }
+        Xq = img(MAXN, MAXK / (A16 ? 8 : 16)); Sx = buf((size_t)MAXN * (MAXK / (QGS4 ? std::min(QGS, QGS4) : QGS)) * 4);
         printf("8-bit multiplies: GS %d, rotation %d, cfg %d,%d,%d%s\n", QGS, rot, QTNv, QOBv, QWGv,
                A16 ? ", turned into 16-bit per layer (no byte dot product)" : "");
     }
@@ -309,9 +327,10 @@ static void gemmq(int epi, const char *tag, const std::string &wn, int N, int M,
 }
 static void rotq(const std::string &wn, cl_mem in, int N, int K, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
-    arg(kRotX, 0, in); arg(kRotX, 1, N); arg(kRotX, 2, K); arg(kRotX, 3, Xq); arg(kRotX, 4, Sx);
-    auto c = cen.find(wn); if (c != cen.end() && !A16) arg(kRotX, 5, c->second.first);
-    run(kRotX, "rotq", 64, n1 - n0, 1, 64, QTv, 0, n0);
+    cl_kernel kr = QGS4 && isq4(wn) ? kRotX4 : kRotX;
+    arg(kr, 0, in); arg(kr, 1, N); arg(kr, 2, K); arg(kr, 3, Xq); arg(kr, 4, Sx);
+    auto c = cen.find(wn); if (c != cen.end() && !A16) arg(kr, 5, c->second.first);
+    run(kr, "rotq", 64, n1 - n0, 1, 64, QTv, 0, n0);
 }
 static void lnmod(cl_mem res, cl_mem sh, cl_mem sc, cl_mem Y, int N, int Dm, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
@@ -322,7 +341,7 @@ static void lnmod(cl_mem res, cl_mem sh, cl_mem sc, cl_mem Y, int N, int Dm, int
 static void lnq(const std::string &wn, cl_mem res, cl_mem sh, cl_mem sc, int N, int Dm, int n0 = 0, int n1 = -1) {
     if (n1 < 0) n1 = N;
     float eps = LNEPS;
-    cl_kernel kr = LNNEXT ? kRotLnL : kRotLn;
+    cl_kernel kr = QGS4 && isq4(wn) ? (LNNEXT ? kRotLnL4 : kRotLn4) : LNNEXT ? kRotLnL : kRotLn;
     arg(kr, 0, res); arg(kr, 1, sh); arg(kr, 2, sc); arg(kr, 3, eps); arg(kr, 4, N); arg(kr, 5, Dm);
     arg(kr, 6, Xq); arg(kr, 7, Sx);
     auto c = cen.find(wn); if (c != cen.end() && !A16) arg(kr, 8, c->second.first);
