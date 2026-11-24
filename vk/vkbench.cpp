@@ -111,7 +111,10 @@ int main(int argc, char **argv) {
         }
     }
     double best = 1e30; std::string bl;
+    const int only = getenv("ONLY") ? atoi(getenv("ONLY")) : -1;   // ONLY=<n>: time just the n-th setting (0 = first)
+    int ci = -1;
     for (auto &c : cfgs) {
+        if (only >= 0 && ++ci != only) continue;
         printf("  %s: ", c.label.c_str());
         if (!c.ok) { printf("not possible here\n"); continue; }
         vk::Pipe P;
