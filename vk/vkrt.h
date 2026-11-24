@@ -42,6 +42,7 @@ struct Ctx {
     VkPhysicalDeviceMemoryProperties mem{};
     Features f;
     std::vector<std::string> exts;
+    bool lowPrio = false;   // the queue was made at low priority (the screen's drawing goes first)
 };
 static Ctx C;
 
@@ -127,9 +128,20 @@ static void init(int devIndex = -1) {
     if (C.f.coopmat) { ecm.cooperativeMatrix = VK_TRUE; *tail = &ecm; tail = &ecm.pNext; en.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); }
     for (auto e : en) C.exts.push_back(e);
 
-    float prio = 1.0f;
+    // GPU_PRIO=low (default; "normal" to switch off): a low-priority queue where the driver offers one
+    // (VK_KHR/EXT_global_priority), so the screen's own drawing goes first and the phone stays smooth while a model
+    // draws, as the OpenCL engine's priority hints do; other chips simply get a normal queue
+    float prio = 0.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = C.qf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    VkDeviceQueueGlobalPriorityCreateInfoKHR gpri{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
+    gpri.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+    const char *gpExt = nullptr;
+    if (!getenv("GPU_PRIO") || strcmp(getenv("GPU_PRIO"), "normal") != 0)
+        for (auto &x : all)
+            if (!strcmp(x.extensionName, "VK_KHR_global_priority") || (!gpExt && !strcmp(x.extensionName, "VK_EXT_global_priority")))
+                gpExt = !strcmp(x.extensionName, "VK_KHR_global_priority") ? "VK_KHR_global_priority" : "VK_EXT_global_priority";
+    if (gpExt) { qci.pNext = &gpri; en.push_back(gpExt); C.exts.push_back(gpExt); C.lowPrio = true; }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &e11; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = (uint32_t)en.size(); dci.ppEnabledExtensionNames = en.data();
@@ -179,6 +191,7 @@ static void describe() {
     printf("Vulkan device: %s (driver %u.%u.%u), subgroup %u, shared %u KB\n", C.props.deviceName,
            VK_VERSION_MAJOR(C.props.driverVersion), VK_VERSION_MINOR(C.props.driverVersion), VK_VERSION_PATCH(C.props.driverVersion),
            C.f.subgroup, C.f.sharedBytes / 1024);
+    printf("  queue priority: %s\n", C.lowPrio ? "low (the screen's drawing goes first)" : "normal");
     printf("  16-bit maths %s, 16-bit buffers %s, 8-bit %s, 8-bit dot product %s%s, matrix hardware %s\n",
            C.f.fp16 ? "yes" : "no", C.f.storage16 ? "yes" : "no", C.f.int8 ? "yes" : "no", C.f.dot8 ? "yes" : "no",
            C.f.dot8 ? (C.f.dot8fast ? " (accelerated)" : " (emulated)") : "", C.f.coopmat ? "yes" : "no");
