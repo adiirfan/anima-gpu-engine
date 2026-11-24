@@ -18,3 +18,4 @@ vk/gen/
 vk/*_x86
 vk/*_android
 ugpu_x86_new
+tools/*_android

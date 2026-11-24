@@ -1,10 +1,11 @@
 // Vulkan multiply bench: every setting of one multiply shader on one shape, checked against the processor and timed.
-//   vkbench [N M K] [reps] [f16|cm16|cm8|cm8s]      (VKDEV picks the device)
-// f16: the plain tiled shader; cm16: the matrix hardware (fp16 products, fp32 totals every KS slices);
+//   vkbench [N M K] [reps] [f16|p16|cm16|cm8|cm8s]      (VKDEV picks the device)
+// f16: the plain tiled shader; p16: the same with fp16 read as packed pairs from 32-bit words (no 16-bit buffers); cm16: the matrix hardware (fp16 products, fp32 totals every KS slices);
 // cm8: the matrix hardware on 8-bit whole numbers (exact 32-bit sums); cm8s: cm8 plus the engine's scale per block of 64.
 // Prints the chip's features, then per setting: ms per multiply, TFLOPS, worst relative error of 64 sampled outputs.
 #include "vkrt.h"
 #include "gemm_f16.spv.h"
+#include "gemm_p16.spv.h"
 #include "gemm_cm16.spv.h"
 #include "gemm_cm8.spv.h"
 #include "gemm_cm8b.spv.h"
@@ -18,8 +19,8 @@ int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     vk::init();
     vk::describe();
-    if (!vk::C.f.storage16) { fprintf(stderr, "no 16-bit buffers on this chip\n"); return 1; }
-    if (mode != "f16" && !vk::C.f.coopmat) { fprintf(stderr, "no matrix hardware on this chip\n"); return 1; }
+    if (!vk::C.f.storage16 && mode != "p16") { fprintf(stderr, "no 16-bit buffers on this chip (try p16)\n"); return 1; }
+    if (mode != "f16" && mode != "p16" && !vk::C.f.coopmat) { fprintf(stderr, "no matrix hardware on this chip\n"); return 1; }
     printf("shape: %u x %u x %u (%.1f GFLOP per multiply), shader %s\n", N, M, K, 2.0 * N * M * K / 1e9, mode.c_str());
 
     std::mt19937 g(1);
@@ -72,15 +73,17 @@ int main(int argc, char **argv) {
     struct Cfg { std::vector<uint32_t> spec; uint32_t gx, gy; std::string label; bool ok; };
     std::vector<Cfg> cfgs;
     const uint32_t *code; size_t bytes;
-    if (mode == "f16") {
-        code = gemm_f16_spv; bytes = sizeof gemm_f16_spv;
+    if (mode == "f16" || mode == "p16") {
+        if (mode == "f16") { code = gemm_f16_spv; bytes = sizeof gemm_f16_spv; } else { code = gemm_p16_spv; bytes = sizeof gemm_p16_spv; }
         const uint32_t t[][5] = {{32, 32, 16, 2, 2}, {64, 64, 16, 4, 4}, {64, 64, 16, 8, 4}, {64, 64, 16, 4, 8}, {128, 64, 16, 8, 4},
                                  {64, 128, 16, 4, 8}, {128, 128, 16, 8, 8}, {128, 128, 8, 8, 8}, {128, 64, 8, 8, 4}};
         for (auto &c : t) {
             const uint32_t th = (c[0] / c[3]) * (c[1] / c[4]);
             char l[96]; snprintf(l, sizeof l, "%3u x %3u, k %2u, per thread %u x %u (%3u threads)", c[0], c[1], c[2], c[3], c[4], th);
             const bool ok = th <= vk::C.props.limits.maxComputeWorkGroupInvocations && (c[0] + c[1]) * c[2] * 2 <= vk::C.f.sharedBytes && K % c[2] == 0;
-            cfgs.push_back({{c[0], c[1], c[2], c[3], c[4], th}, (M + c[1] - 1) / c[1], (N + c[0] - 1) / c[0], l, ok});
+            const uint32_t HC = mode == "p16" && getenv("HC") ? atoi(getenv("HC")) : 0;   // p16: fp16 sums of HC products
+            if (mode == "p16") cfgs.push_back({{c[0], c[1], c[2], c[3], c[4], th, HC}, (M + c[1] - 1) / c[1], (N + c[0] - 1) / c[0], l, ok && (HC == 0 || (c[2] % HC == 0 && c[4] % 2 == 0))});
+            else cfgs.push_back({{c[0], c[1], c[2], c[3], c[4], th}, (M + c[1] - 1) / c[1], (N + c[0] - 1) / c[0], l, ok});
         }
     } else if (mode == "cm8s") {
         code = gemm_cm8b_spv; bytes = sizeof gemm_cm8b_spv;
