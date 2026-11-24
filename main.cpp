@@ -39,6 +39,11 @@ int main(int argc, char **argv) {
     KSRC = slurp(getenv("KERNELS") ? getenv("KERNELS") : "kernels.cl");
     std::string model = ops::loadModel(weights);
     if (model.empty()) model = "anima";
+    // old drivers' pair sums (ACC32=4, e.g. Adreno 630): Anima also takes runs of 4 in every multiply but the plain
+    // ones (HSUM_MASK=30: runs of 4 there throw the middle blocks far off) and its GELU as a pass of its own: faster
+    // steps, same accuracy (checked block by block against the Radeon, and whole pictures against exact fp32 sums).
+    // Other models are unchecked, so they keep pairs.
+    if (model == "anima" && !getenv("KDEFS") && KEXTRA.find("-DACC32=4") != std::string::npos) KEXTRA += " -DHSUM=4 -DHSUM_MASK=30";
     atexit(memReport);
     printf("model %s, load %.1f s (%zu weights)\n", model.c_str(),
            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), W.size());

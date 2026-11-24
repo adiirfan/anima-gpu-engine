@@ -197,6 +197,9 @@ static std::string kslice(const char *from, const char *to = nullptr) {
     const size_t b = to ? KSRC.find(to) : std::string::npos;
     return KSRC.substr(0, KSRC.find("__kernel")) + KSRC.substr(a, b == std::string::npos ? std::string::npos : b - a);
 }
+// the shared-weight multiply (gemml): built alone, as the tile multiply beside it makes Adreno 630's 2018 driver hang
+// gemml whenever its sums run longer than pairs (HSUM=4)
+static std::string gemmlSrc() { return kslice("// ======== shared-weight multiply", "// ======== end of shared-weight multiply"); }
 
 // 8-bit weights as an image: texel (o, k16) = 16 int8 inputs of output o. Wider than the chip allows (Klein's
 // 18432-row SwiGLU layers on Adreno's 16384), the outputs are folded into P parts stacked vertically: output o of
@@ -537,7 +540,8 @@ static void tune(const std::string &src, const std::string &cacheFile) {
         char o[256];
         snprintf(o, sizeof o, "-DEPI=0 -DTN=%d -DTM=%d -DTNI=%d -DG=%d -DWG=%d -DKC=%d", g.local ? 6 : g.a, g.local ? 2 : g.b,
                  g.local ? g.a : 2, g.local ? g.b : 4, g.local ? g.c : 128, g.local ? g.d : 64);
-        const char *s = src.c_str();
+        const std::string ks = g.local ? gemmlSrc() : src;   // the source real runs use
+        const char *s = ks.c_str();
         cl_program p = clCreateProgramWithSource(ctx, 1, &s, 0, &err); CK(err);
         if (clBuildProgram(p, 1, &dev, (std::string(o) + KEXTRA).c_str(), 0, 0)) {   // the options real runs use
             static bool told = false;

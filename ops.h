@@ -12,6 +12,11 @@ static const int HD = 128;                  // channels per attention head (ever
 static int HEADS = 16, D = 2048;            // the model's heads and width (set by the model)
 static int MAXN = 1024, MAXK = 8192;        // largest token count / multiply input the work buffers are sized for
 
+// GELUP: the GELU multiply (epi 1) as a plain multiply into a scratch image plus the gelu8 pass. On by default with
+// HSUM=4 (Adreno 630: the erf inside the multiply costs the threads the shorter sums gained); GELU_PASS=0/1 forces it
+static bool GELUP = false;
+static cl_mem geluScr = nullptr; static int geluW = 0, geluH = 0;
+static cl_kernel kGelu8;
 static cl_kernel kG[4], kLn, kGemv, kPrepSelf, kPrepKV, kPq, kPqc, kKVdown, kPVsm, kFlash, kSgate, kGrp, kBiasGelu;
 static int KVREP = 1;        // query heads per key / value head (set before init; Krea 4)
 static float LNEPS = 1e-6f;  // the norm before 8-bit layers (Krea 1e-5)
@@ -154,15 +159,17 @@ static void init(int heads, int width, int maxTokens, int maxK) {
     HEADS = heads; D = width; MAXN = maxTokens; MAXK = maxK;
     char o[256];
     if (!getenv("LCFG") && !getenv("CFG") && getenv("TUNEFILE")) tune(KSRC, getenv("TUNEFILE"));
+    GELUP = LOCALGEMM && (getenv("GELU_PASS") ? atoi(getenv("GELU_PASS")) != 0 : KEXTRA.find("HSUM=4") != std::string::npos);
     for (int e = 0; e < 4; e++) {
-        snprintf(o, sizeof o, "-DTN=%d -DTM=%d -DEPI=%d -DTNI=%d -DG=%d -DWG=%d -DKC=%d", TN, TM, e, TNI, GG, WGS, KCS);
-        kG[e] = kern(build(KSRC, o), LOCALGEMM ? "gemml" : "gemm");
+        snprintf(o, sizeof o, "-DTN=%d -DTM=%d -DEPI=%d -DTNI=%d -DG=%d -DWG=%d -DKC=%d%s", TN, TM, e, TNI, GG, WGS, KCS,
+                 e == 1 && GELUP ? " -DGELU_PASS=1" : "");
+        kG[e] = LOCALGEMM ? kern(build(gemmlSrc(), o), "gemml") : kern(build(KSRC, o), "gemm");
     }
     const std::string qkf = QKF ? " -DQKFULL=1" : "";
     cl_program pb = build(KSRC, "-DDO_Q=1 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf);
     kLn = kern(pb, "lnmod2"); kGemv = kern(pb, "gemv"); kRmsAdd = kern(pb, "rmsadd"); kPq = kern(pb, "prepq"); kRowRms = kern(pb, "rowrms");
     kPrepSelf = kern(build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=1" + qkf + (KVREP > 1 ? " -DKVR=" + std::to_string(KVREP) : "")), "attnprep");
-    kSgate = kern(pb, "sgate"); kGrp = kern(pb, "grpattn"); kBiasGelu = kern(pb, "biasgelu"); kSwiglu16 = kern(pb, "swiglu16");
+    kSgate = kern(pb, "sgate"); kGrp = kern(pb, "grpattn"); kBiasGelu = kern(pb, "biasgelu"); kGelu8 = kern(pb, "gelu8"); kSwiglu16 = kern(pb, "swiglu16");
     if (QKF) { rqB = buf((size_t)maxTokens * 4); rkB = buf((size_t)maxTokens * 4); }
     {
         cl_program pc = build(KSRC, "-DDO_Q=0 -DDO_K=1 -DDO_V=1 -DROPE=0 -DMAXT=2" + qkf);
@@ -179,7 +186,7 @@ static void init(int heads, int width, int maxTokens, int maxK) {
         int a = TNI, g2 = GG, wg = WGS, kc = KCS;
         if (getenv("PVCFG")) sscanf(getenv("PVCFG"), "%d,%d,%d,%d", &a, &g2, &wg, &kc);
         PVT = a; PVG = g2; PVWG = wg;
-        snprintf(o, sizeof o, "-DEPI=0 -DTNI=%d -DG=%d -DWG=%d -DKC=%d", a, g2, wg, kc);
+        snprintf(o, sizeof o, "-DEPI=0 -DIS_PVSM=1 -DTNI=%d -DG=%d -DWG=%d -DKC=%d", a, g2, wg, kc);
         kPVsm = kern(build(kslice("// ======== softmax inside"), o), "gemmlsm");
     }
     if (Q8) {
@@ -291,9 +298,15 @@ static void gemm(int epi, const char *tag, cl_mem X, cl_mem Wm, int n, int M, in
                  int n0 = 0, int Nall = 0) {
     cl_kernel k = kG[epi];
     const int Nk = Nall ? Nall : n;   // the kernel's N: row stride of the residual stream
+    const bool split = epi == 1 && GELUP;   // the multiply goes to the scratch image, gelu8 then writes out
+    if (split && (batch != 1 || yby || yb0)) { fprintf(stderr, "GELU_PASS: batched GELU multiplies are not supported\n"); exit(1); }
+    if (split && (geluW < n || geluH < M / 8)) {
+        if (geluScr) { clReleaseMemObject(geluScr); MEMB -= (size_t)geluW * geluH * 16; }
+        geluW = std::max(geluW, n); geluH = std::max(geluH, M / 8); geluScr = img(geluW, geluH);
+    }
     arg(k, 0, X); arg(k, 1, Wm); arg(k, 2, Nk); arg(k, 3, M); arg(k, 4, K);
     arg(k, 5, xby); arg(k, 6, wbx); arg(k, 7, wby); arg(k, 8, yby); arg(k, 9, xb0); arg(k, 10, wb0); arg(k, 11, yb0);
-    arg(k, 12, out);
+    arg(k, 12, split ? geluScr : out);
     if (epi >= 2) arg(k, 13, gate ? gate : out);
     arg(k, epi >= 2 ? 14 : 13, n);
     // token batches whose input fits the cache: otherwise every block of outputs re-reads the whole input
@@ -304,6 +317,10 @@ static void gemm(int epi, const char *tag, cl_mem X, cl_mem Wm, int n, int M, in
         const int cn = std::min(chunk, n - c0);
         if (LOCALGEMM) run(k, tag, (cn + TNI - 1) / TNI, M / 4 / GG, batch, WGS, 1, c0 / TNI, 0);
         else run(k, tag, M / 4 / TM, (cn + TN - 1) / TN, batch, L0, L1, 0, c0 / TN);
+    }
+    if (split) {
+        arg(kGelu8, 0, geluScr); arg(kGelu8, 1, n0); arg(kGelu8, 2, n); arg(kGelu8, 3, out);
+        run(kGelu8, "gelu", n - n0, M / 8, 1, 16, 4);
     }
 }
 static void gemmq(int epi, const char *tag, const std::string &wn, int N, int M, int K, cl_mem out, cl_mem gate,
